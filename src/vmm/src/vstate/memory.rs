@@ -232,9 +232,9 @@ impl GuestMemoryExtension for GuestMemoryMmap {
     ) -> Result<Self, MemoryError> {
         match file {
             Some(f) => {
-                if huge_pages.is_hugetlbfs() {
-                    return Err(MemoryError::HugetlbfsSnapshot);
-                }
+                // if huge_pages.is_hugetlbfs() {
+                //     return Err(MemoryError::HugetlbfsSnapshot);
+                // }
 
                 let regions = state
                     .regions
