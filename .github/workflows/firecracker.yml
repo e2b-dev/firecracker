@@ -27,7 +27,7 @@ jobs:
         run: |
           # The format will be: latest_tag-branch-latest_commit_hash — v1.7.0-dev_g8bb88311
 
-          version_name=$(git describe --tags --abbrev=0 ${{ github.head_ref }}-${{ github.head_ref }}_${{ github.sha }}
+          version_name=$(git describe --tags --abbrev=0 ${{ github.head_ref }})-${{ github.head_ref }}_${{ github.sha }}
           echo "Version name: $version_name"
           mkdir "builds/${version_name}"
 
