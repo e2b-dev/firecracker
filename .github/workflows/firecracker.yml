@@ -3,6 +3,9 @@ name: Build firecracker
 on:
   push
 
+permissions:
+  id-token: write
+
 jobs:
   publish:
     name: Build and Upload FC
