@@ -27,7 +27,7 @@ jobs:
           latest_tag=$(git describe --tags --abbrev=0 HEAD~)
           echo "Latest Tag: $latest_tag"
 
-          version_name="$latest_tag-${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}_${{ github.sha }}"
+          version_name="$latest_tag-${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}_${GITHUB_SHA::7}"
           echo "Version name: $version_name"
           mkdir -p "builds/${version_name}"
 
