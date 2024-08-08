@@ -14,9 +14,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Get tags
-        run: git fetch --tags origin
-
       - name: Setup Service Account
         uses: google-github-actions/auth@v1
         with:
@@ -26,6 +23,11 @@ jobs:
       - name: Build FC versions
         run: |
           # The format will be: latest_tag-branch-latest_commit_hash — v1.7.0-dev_g8bb88311
+          echo "$(git show-ref --tags -d)"
+
+          git fetch --prune --unshallow
+          latest_tag=$(git describe --tags --abbrev=0 HEAD~)
+          echo "Latest Tag: $latest_tag"
 
           version_name=$(git describe --tags --abbrev=0 ${{ github.head_ref }})-${{ github.head_ref }}_${{ github.sha }}
           echo "Version name: $version_name"
