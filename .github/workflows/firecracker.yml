@@ -1,0 +1,39 @@
+name: Build firecracker
+
+on:
+  push
+
+jobs:
+  publish:
+    name: Build and Upload FC
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Service Account
+        uses: google-github-actions/auth@v1
+        with:
+          workload_identity_provider: ${{ secrets.E2B_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.E2B_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Build FC versions
+        run: |
+          # The format will be: latest_tag-branch-latest_commit_hash — v1.7.0-dev_g8bb88311
+
+          version_name=$(git describe --tags --abbrev=0 $(git rev-parse HEAD))-${{ github.head_ref }}_${{ github.sha }}
+          echo "Version name: $version_name"
+          mkdir "builds/${version_name}"
+
+          echo "Building Firecracker version: $version_name"
+          tools/devtool -y build --release
+
+          cp build/cargo_target/x86_64-unknown-linux-musl/release/firecracker  builds/${version_name}/firecracker"
+
+      - name: Upload FC versions
+        uses: "google-github-actions/upload-cloud-storage@v1"
+        with:
+          path: "./packages/fc-versions/builds"
+          destination: "${{ secrets.E2B_GCP_PROJECT_ID }}-fc-versions"
+          gzip: false
+          parent: false
