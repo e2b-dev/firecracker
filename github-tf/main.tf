@@ -46,9 +46,8 @@ resource "google_iam_workload_identity_pool_provider" "gha_identity_pool_provide
   attribute_mapping = {
     "google.subject"       = "assertion.sub"
     "attribute.repository" = "assertion.repository"
-    "attribute.ref"        = "assertion.ref"
   }
-  attribute_condition = "assertion.repository == \"${var.github_organization}/${var.github_repository}\" && assertion.ref == \"refs/heads/main\""
+  attribute_condition = "assertion.repository == \"${var.github_organization}/${var.github_repository}\""
 
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
