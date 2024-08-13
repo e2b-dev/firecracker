@@ -78,6 +78,7 @@ where
         regions: Vec<(FileOffset, GuestAddress, usize)>,
         track_dirty_pages: bool,
         shared: bool,
+        huge_pages: HugePageConfig,
     ) -> Result<Self, MemoryError>;
 
     /// Creates a GuestMemoryMmap given a `file` containing the data
@@ -152,7 +153,7 @@ impl GuestMemoryExtension for GuestMemoryMmap {
             })
             .collect::<Result<Vec<_>, MemoryError>>()?;
 
-        Self::from_raw_regions_file(regions, track_dirty_pages, true)
+        Self::from_raw_regions_file(regions, track_dirty_pages, true, huge_pages)
     }
 
     /// Creates a GuestMemoryMmap from raw regions backed by anonymous memory.
@@ -195,12 +196,13 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         regions: Vec<(FileOffset, GuestAddress, usize)>,
         track_dirty_pages: bool,
         shared: bool,
+        huge_pages: HugePageConfig,
     ) -> Result<Self, MemoryError> {
         let prot = libc::PROT_READ | libc::PROT_WRITE;
         let flags = if shared {
-            libc::MAP_NORESERVE | libc::MAP_SHARED
+            libc::MAP_NORESERVE | libc::MAP_SHARED | huge_pages.mmap_flags()
         } else {
-            libc::MAP_NORESERVE | libc::MAP_PRIVATE
+            libc::MAP_NORESERVE | libc::MAP_PRIVATE | huge_pages.mmap_flags()
         };
         let regions = regions
             .into_iter()
@@ -233,10 +235,6 @@ impl GuestMemoryExtension for GuestMemoryMmap {
     ) -> Result<Self, MemoryError> {
         match file {
             Some(f) => {
-                if huge_pages.is_hugetlbfs() {
-                    return Err(MemoryError::HugetlbfsSnapshot);
-                }
-
                 let regions = state
                     .regions
                     .iter()
@@ -249,7 +247,7 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                     .collect::<Result<Vec<_>, std::io::Error>>()
                     .map_err(MemoryError::FileError)?;
 
-                Self::from_raw_regions_file(regions, track_dirty_pages, false)
+                Self::from_raw_regions_file(regions, track_dirty_pages, false, huge_pages)
             }
             None => {
                 let regions = state
@@ -472,6 +470,8 @@ mod tests {
     fn test_from_raw_regions_file() {
         let region_size = 0x10000;
 
+        let huge_pages = HugePageConfig::None;
+
         let file = TempFile::new().unwrap().into_file();
         let file_size = 4 * region_size;
         file.set_len(file_size as u64).unwrap();
@@ -502,7 +502,7 @@ mod tests {
         // Test that all regions are guarded.
         {
             let guest_memory =
-                GuestMemoryMmap::from_raw_regions_file(regions.clone(), false, false).unwrap();
+                GuestMemoryMmap::from_raw_regions_file(regions.clone(), false, false, huge_pages).unwrap();
             guest_memory.iter().for_each(|region| {
                 assert_eq!(region.size(), region_size);
                 assert!(region.file_offset().is_some());
@@ -513,7 +513,7 @@ mod tests {
         // Check dirty page tracking is off.
         {
             let guest_memory =
-                GuestMemoryMmap::from_raw_regions_file(regions.clone(), false, false).unwrap();
+                GuestMemoryMmap::from_raw_regions_file(regions.clone(), false, false, huge_pages).unwrap();
             guest_memory.iter().for_each(|region| {
                 assert!(region.bitmap().is_none());
             });
@@ -522,7 +522,7 @@ mod tests {
         // Check dirty page tracking is on.
         {
             let guest_memory =
-                GuestMemoryMmap::from_raw_regions_file(regions, true, false).unwrap();
+                GuestMemoryMmap::from_raw_regions_file(regions, true, false, huge_pages).unwrap();
             guest_memory.iter().for_each(|region| {
                 assert!(region.bitmap().is_some());
             });
