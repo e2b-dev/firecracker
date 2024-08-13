@@ -3,3 +3,6 @@ build/
 src/
 tests/
 docs/
+.env.*
+.last_used_env
+.terraform*
