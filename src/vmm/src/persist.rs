@@ -162,8 +162,12 @@ pub fn create_snapshot(
 
     snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
 
-    vmm.vm
-        .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    // Skip memory file dumping if mem_file_path is "/dev/null"
+    // Note: This doesn't actually write to /dev/null - the dump is skipped entirely
+    if params.mem_file_path.to_string_lossy() != "/dev/null" {
+        vmm.vm
+            .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    }
 
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is because we don't mark pages as dirty during runtime

@@ -249,15 +249,19 @@ impl Vm {
             //   would be reflected in the mmap of the file, meaning a truncate operation would zero
             //   out guest memory, and thus corrupt the VM).
             // - For diff snapshots, we want to merge the diff layer directly into the file.
-            if file_size != expected_size {
+            // - Skip truncation for /dev/null as it's not a regular file and can't be truncated.
+            if file_size != expected_size && mem_file_path.to_string_lossy() != "/dev/null" {
                 file.set_len(0)
                     .map_err(|err| MemoryBackingFile("truncate", err))?;
             }
         }
 
         // Set the length of the file to the full size of the memory area.
-        file.set_len(expected_size)
-            .map_err(|e| MemoryBackingFile("set_length", e))?;
+        // Skip setting length for /dev/null as it's not a regular file.
+        if mem_file_path.to_string_lossy() != "/dev/null" {
+            file.set_len(expected_size)
+                .map_err(|e| MemoryBackingFile("set_length", e))?;
+        }
 
         match snapshot_type {
             SnapshotType::Diff => {
