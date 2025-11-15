@@ -652,9 +652,11 @@ impl RuntimeApiController {
 
                 let mut instance_info = locked_vmm.instance_info();
 
-                instance_info.memory_regions = locked_vmm
-                    .vm
-                    .guest_memory_mappings(&VmInfo::from(&self.vm_resources));
+                instance_info.memory_regions = Some(
+                    locked_vmm
+                        .vm
+                        .guest_memory_mappings(&VmInfo::from(&self.vm_resources)),
+                );
 
                 Ok(VmmData::InstanceInformation(instance_info))
             }

@@ -3,7 +3,7 @@
 use std::fmt::{self, Display, Formatter};
 
 use crate::vstate::vm::GuestMemoryRegionMapping;
-use serde::{Serialize, ser};
+use serde::{ser, Serialize};
 
 /// Enumerates microVM runtime states.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -48,5 +48,5 @@ pub struct InstanceInfo {
     /// The name of the application that runs the microVM.
     pub app_name: String,
     /// The regions of the guest memory.
-    pub memory_regions: Vec<GuestMemoryRegionMapping>,
+    pub memory_regions: Option<Vec<GuestMemoryRegionMapping>>,
 }
