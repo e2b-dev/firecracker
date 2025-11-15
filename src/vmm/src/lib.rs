@@ -466,6 +466,7 @@ impl Vmm {
         &self.guest_memory
     }
 
+    /// Returns the memory mappings for the guest memory.
     pub fn guest_memory_mappings(&self, vm_info: &VmInfo) -> Vec<GuestMemoryRegionMapping> {
         let mut offset = 0;
         let mut mappings = Vec::new();
