@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::fmt::{self, Display, Formatter};
 
-use crate::vstate::vm::GuestMemoryRegionMapping;
+use crate::GuestMemoryRegionMapping;
 use serde::{ser, Serialize};
 
 /// Enumerates microVM runtime states.
@@ -48,5 +48,6 @@ pub struct InstanceInfo {
     /// The name of the application that runs the microVM.
     pub app_name: String,
     /// The regions of the guest memory.
-    pub memory_regions: Vec<GuestMemoryRegionMapping>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_regions: Option<Vec<GuestMemoryRegionMapping>>,
 }

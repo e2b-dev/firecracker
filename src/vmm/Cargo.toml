@@ -9,15 +9,18 @@ license = "Apache-2.0"
 bench = false
 
 [dependencies]
-acpi_tables = { path = "../acpi-tables" } 
-aes-gcm =  { version = "0.10.1", default-features = false, features = ["aes"] }
+acpi_tables = { path = "../acpi-tables" }
+aes-gcm = { version = "0.10.1", default-features = false, features = ["aes"] }
 arrayvec = { version = "0.7.6", optional = true }
 aws-lc-rs = { version = "1.10.0", features = ["bindgen"] }
 base64 = "0.22.1"
 bincode = "1.2.1"
 bitflags = "2.6.0"
 crc64 = "2.0.0"
-derive_more = { version = "1.0.0", default-features = false, features = ["from", "display"] }
+derive_more = { version = "1.0.0", default-features = false, features = [
+  "from",
+  "display",
+] }
 displaydoc = "0.2.5"
 event-manager = "0.4.0"
 gdbstub = { version = "0.7.3", optional = true }
@@ -43,7 +46,10 @@ userfaultfd = "0.8.1"
 utils = { path = "../utils" }
 vhost = { version = "0.13.0", features = ["vhost-user-frontend"] }
 vm-allocator = "0.1.0"
-vm-memory = { version = "0.16.0", features = ["backend-mmap", "backend-bitmap"] }
+vm-memory = { version = "0.16.0", features = [
+  "backend-mmap",
+  "backend-bitmap",
+] }
 vm-superio = "0.8.0"
 vmm-sys-util = { version = "0.12.1", features = ["with-serde"] }
 zerocopy = { version = "0.8.8" }
@@ -80,3 +86,8 @@ harness = false
 
 [lints]
 workspace = true
+
+[patch.crates-io]
+aws-lc-sys = "=0.29.0"
+aws-lc-rs = "=1.13.1"
+aws-lc-fips-sys = "=0.13.7"

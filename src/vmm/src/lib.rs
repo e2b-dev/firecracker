@@ -153,6 +153,7 @@ use crate::vstate::memory::{
 use crate::vstate::vcpu::VcpuState;
 pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
 pub use crate::vstate::vm::Vm;
+use serde::{Deserialize, Serialize};
 
 /// Shorthand type for the EventManager flavour used by Firecracker.
 pub type EventManager = BaseEventManager<Arc<Mutex<dyn MutEventSubscriber>>>;
@@ -189,6 +190,20 @@ pub enum FcExitCode {
     BadConfiguration = 152,
     /// Command line arguments parsing error.
     ArgParsing = 153,
+}
+
+/// Describes the region of guest memory that can be used for creating the memfile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GuestMemoryRegionMapping {
+    /// Base host virtual address where the guest memory contents for this region
+    /// should be copied/populated.
+    pub base_host_virt_addr: u64,
+    /// Region size.
+    pub size: usize,
+    /// Offset in the backend file/buffer where the region contents are.
+    pub offset: u64,
+    /// The configured page size for this memory region.
+    pub page_size: usize,
 }
 
 /// Timeout used in recv_timeout, when waiting for a vcpu response on
@@ -449,6 +464,21 @@ impl Vmm {
     /// Returns a reference to the inner `GuestMemoryMmap` object.
     pub fn guest_memory(&self) -> &GuestMemoryMmap {
         &self.guest_memory
+    }
+
+    pub fn guest_memory_mappings(&self, vm_info: &VmInfo) -> Vec<GuestMemoryRegionMapping> {
+        let mut offset = 0;
+        let mut mappings = Vec::new();
+        for mem_region in self.guest_memory().iter() {
+            mappings.push(GuestMemoryRegionMapping {
+                base_host_virt_addr: mem_region.as_ptr() as u64,
+                size: mem_region.size(),
+                offset,
+                page_size: vm_info.huge_pages.page_size_kib(),
+            });
+            offset += mem_region.size() as u64;
+        }
+        mappings
     }
 
     /// Sets RDA bit in serial console
