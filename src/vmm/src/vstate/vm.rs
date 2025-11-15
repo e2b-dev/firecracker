@@ -27,6 +27,20 @@ use crate::cpu_config::templates::KvmCapability;
 use crate::utils::u64_to_usize;
 use crate::vstate::memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
+/// Describes the region of guest memory that can be used for creating the memfile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GuestMemoryRegionMapping {
+    /// Base host virtual address where the guest memory contents for this region
+    /// should be copied/populated.
+    pub base_host_virt_addr: u64,
+    /// Region size.
+    pub size: usize,
+    /// Offset in the backend file/buffer where the region contents are.
+    pub offset: u64,
+    /// The configured page size for this memory region.
+    pub page_size: usize,
+}
+
 /// Errors associated with the wrappers over KVM ioctls.
 /// Needs `rustfmt::skip` to make multiline comments work
 #[rustfmt::skip]

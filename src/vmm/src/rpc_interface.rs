@@ -646,9 +646,17 @@ impl RuntimeApiController {
             GetVmMachineConfig => Ok(VmmData::MachineConfiguration(MachineConfig::from(
                 &self.vm_resources.vm_config,
             ))),
-            GetVmInstanceInfo => Ok(VmmData::InstanceInformation(
-                self.vmm.lock().expect("Poisoned lock").instance_info(),
-            )),
+            GetVmInstanceInfo => {
+                let locked_vmm = self.vmm.lock().expect("Poisoned lock");
+
+                let mut instance_info = locked_vmm.instance_info();
+
+                instance_info.memory_regions = locked_vmm
+                    .vm
+                    .guest_memory_mappings(&VmInfo::from(&self.vm_resources));
+
+                Ok(VmmData::InstanceInformation(instance_info))
+            }
             GetVmmVersion => Ok(VmmData::VmmVersion(
                 self.vmm.lock().expect("Poisoned lock").version(),
             )),
@@ -1150,7 +1158,7 @@ mod tests {
             CreateSnapshotParams {
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: PathBuf::new(),
-                mem_file_path: PathBuf::new(),
+                mem_file_path: Some(PathBuf::new()),
             },
         )));
         #[cfg(target_arch = "x86_64")]

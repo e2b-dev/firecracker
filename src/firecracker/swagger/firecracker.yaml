@@ -990,6 +990,32 @@ definitions:
       vmm_version:
         description: MicroVM hypervisor build version.
         type: string
+      memory_regions:
+        type: array
+        description: The regions of the guest memory.
+        items:
+          $ref: "#/definitions/GuestMemoryRegion"
+
+  GuestMemoryRegionMapping:
+    type: object
+    description: Describes the region of guest memory that can be used for creating the memfile.
+    required:
+      - base_host_virt_addr
+      - size
+      - offset
+      - page_size
+    properties:
+      base_host_virt_addr:
+        type: integer
+      size:
+        description: The size of the region in bytes.
+        type: integer
+      offset:
+        description: The offset of the region in bytes.
+        type: integer
+      page_size:
+        description: The page size of the region in pages.
+        type: integer
 
   Logger:
     type: object
