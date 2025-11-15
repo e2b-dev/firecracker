@@ -13,11 +13,12 @@ use std::sync::Arc;
 
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use kvm_ioctls::VmFd;
+use serde::{Deserialize, Serialize};
 use vmm_sys_util::eventfd::EventFd;
 
 pub use crate::arch::{ArchVm as Vm, ArchVmError, VmState};
 use crate::logger::info;
-use crate::persist::CreateSnapshotError;
+use crate::persist::{CreateSnapshotError, VmInfo};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::snapshot::SnapshotType;
 use crate::vstate::memory::{
@@ -34,6 +35,20 @@ pub struct VmCommon {
     max_memslots: usize,
     /// The guest memory of this Vm.
     pub guest_memory: GuestMemoryMmap,
+}
+
+/// Describes the region of guest memory that can be used for creating the memfile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GuestMemoryRegionMapping {
+    /// Base host virtual address where the guest memory contents for this region
+    /// should be copied/populated.
+    pub base_host_virt_addr: u64,
+    /// Region size.
+    pub size: usize,
+    /// Offset in the backend file/buffer where the region contents are.
+    pub offset: u64,
+    /// The configured page size for this memory region.
+    pub page_size: usize,
 }
 
 /// Errors associated with the wrappers over KVM ioctls.
@@ -183,6 +198,22 @@ impl Vm {
     /// Gets a reference to this [`Vm`]'s [`GuestMemoryMmap`] object
     pub fn guest_memory(&self) -> &GuestMemoryMmap {
         &self.common.guest_memory
+    }
+
+    /// Gets the mappings for the guest memory.
+    pub fn guest_memory_mappings(&self, vm_info: &VmInfo) -> Vec<GuestMemoryRegionMapping> {
+        let mut offset = 0;
+        let mut mappings = Vec::new();
+        for mem_region in self.guest_memory().iter() {
+            mappings.push(GuestMemoryRegionMapping {
+                base_host_virt_addr: mem_region.as_ptr() as u64,
+                size: mem_region.size(),
+                offset,
+                page_size: vm_info.huge_pages.page_size(),
+            });
+            offset += mem_region.size() as u64;
+        }
+        mappings
     }
 
     /// Resets the KVM dirty bitmap for each of the guest's memory regions.
