@@ -63,4 +63,6 @@ pub enum VirtioBlockError {
     RateLimiter(std::io::Error),
     /// Persistence error: {0}
     Persist(crate::devices::virtio::persist::PersistError),
+    /// Async file engine still has {0} pending operations.
+    PendingAsyncOperations(u32),
 }

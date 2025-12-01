@@ -119,6 +119,10 @@ impl AsyncFileEngine {
         &self.completion_evt
     }
 
+    pub fn pending_ops(&self) -> u32 {
+        self.ring.num_ops()
+    }
+
     pub fn push_read(
         &mut self,
         offset: u64,

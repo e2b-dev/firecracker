@@ -265,7 +265,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                              snapshotting yet"
                         );
                     } else {
-                        block.prepare_save();
+                        block.prepare_save()?;
                         let device_state = block.save();
                         states.block_devices.push(VirtioDeviceState {
                             device_id,

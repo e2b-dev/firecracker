@@ -311,7 +311,7 @@ impl<'a> Persist<'a> for PciDevices {
                              snapshotting yet"
                         );
                     } else {
-                        block_dev.prepare_save();
+                        block_dev.prepare_save()?;
                         let device_state = block_dev.save();
                         state.block_devices.push(VirtioDeviceState {
                             device_id: block_dev.id().to_string(),
