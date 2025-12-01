@@ -50,7 +50,7 @@ process:
 ```
 
 The other Logger fields have, in this case, the default values:
-`Level -> Warning`, `show_level -> false`, `show_log_origin -> false`. For
+`Level -> Debug`, `show_level -> false`, `show_log_origin -> false`. For
 configuring these too, you can also pass the following optional parameters:
 `--level <log_level>`, `--show-level`, `--show-log-origin`:
 

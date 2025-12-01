@@ -98,6 +98,18 @@ pub struct PendingRequest {
 }
 
 impl PendingRequest {
+    pub fn request_type(&self) -> RequestType {
+        self.r#type
+    }
+
+    pub fn desc_idx(&self) -> u16 {
+        self.desc_idx
+    }
+
+    pub fn data_len(&self) -> u32 {
+        self.data_len
+    }
+
     fn write_status_and_finish(
         self,
         status: &Status,

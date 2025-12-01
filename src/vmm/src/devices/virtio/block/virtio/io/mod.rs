@@ -172,6 +172,13 @@ impl FileEngine {
             FileEngine::Sync(engine) => engine.flush().map_err(BlockIoError::Sync),
         }
     }
+
+    pub fn pending_async_ops(&self) -> u32 {
+        match self {
+            FileEngine::Async(engine) => engine.pending_ops(),
+            FileEngine::Sync(_) => 0,
+        }
+    }
 }
 
 #[cfg(test)]
