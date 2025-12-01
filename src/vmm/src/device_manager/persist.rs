@@ -265,7 +265,9 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                              snapshotting yet"
                         );
                     } else {
-                        block.prepare_save()?;
+                        if let Err(err) = block.prepare_save() {
+                            warn!("Failed to prepare block device for save: {:?}", err);
+                        }
                         let device_state = block.save();
                         states.block_devices.push(VirtioDeviceState {
                             device_id,
