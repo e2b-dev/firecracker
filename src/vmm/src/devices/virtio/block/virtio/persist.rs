@@ -16,6 +16,7 @@ use crate::devices::virtio::device::{ActiveState, DeviceState};
 use crate::devices::virtio::generated::virtio_blk::VIRTIO_BLK_F_RO;
 use crate::devices::virtio::generated::virtio_ids::VIRTIO_ID_BLOCK;
 use crate::devices::virtio::persist::VirtioDeviceState;
+use crate::logger::debug;
 use crate::rate_limiter::RateLimiter;
 use crate::rate_limiter::persist::RateLimiterState;
 use crate::snapshot::Persist;
@@ -69,6 +70,11 @@ impl Persist<'_> for VirtioBlock {
     type Error = VirtioBlockError;
 
     fn save(&self) -> Self::State {
+        let pending_ops = self.disk.file_engine.pending_async_ops();
+        debug!(
+            "virtio-block '{}' save invoked with pending_async_ops={}",
+            self.id, pending_ops
+        );
         // Save device state.
         VirtioBlockState {
             id: self.id.clone(),

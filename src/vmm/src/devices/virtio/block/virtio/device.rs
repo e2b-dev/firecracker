@@ -475,6 +475,11 @@ impl VirtioBlock {
         let active_state = self.device_state.active_state().unwrap();
         let queue = &mut self.queues[0];
         let mut processed = 0_u32;
+        let pending_before = engine.pending_ops();
+        debug!(
+            "virtio-block '{}' starting async completion drain: pending_ops={}",
+            self.id, pending_before
+        );
 
         loop {
             match engine.pop(&active_state.mem) {
@@ -520,8 +525,10 @@ impl VirtioBlock {
                 });
         }
         debug!(
-            "virtio-block '{}' processed {} io_uring completions",
-            self.id, processed
+            "virtio-block '{}' processed {} io_uring completions; pending_ops={} after drain",
+            self.id,
+            processed,
+            engine.pending_ops()
         );
     }
 

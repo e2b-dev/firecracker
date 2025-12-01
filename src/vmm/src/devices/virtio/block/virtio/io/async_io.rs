@@ -131,6 +131,8 @@ impl AsyncFileEngine {
         count: u32,
         req: PendingRequest,
     ) -> Result<(), RequestError<AsyncIoError>> {
+        let req_type = req.request_type();
+        let desc_idx = req.desc_idx();
         let buf = match mem.get_slice(addr, count as usize) {
             Ok(slice) => slice.ptr_guard_mut().as_ptr(),
             Err(err) => {
@@ -154,7 +156,17 @@ impl AsyncFileEngine {
             .map_err(|(io_uring_error, data)| RequestError {
                 req: data.req,
                 error: AsyncIoError::IoUring(io_uring_error),
-            })
+            })?;
+
+        debug!(
+            "AsyncFileEngine queued {:?} request desc_idx={} offset={} len={} pending_ops={}",
+            req_type,
+            desc_idx,
+            offset,
+            count,
+            self.pending_ops()
+        );
+        Ok(())
     }
 
     pub fn push_write(
@@ -165,6 +177,8 @@ impl AsyncFileEngine {
         count: u32,
         req: PendingRequest,
     ) -> Result<(), RequestError<AsyncIoError>> {
+        let req_type = req.request_type();
+        let desc_idx = req.desc_idx();
         let buf = match mem.get_slice(addr, count as usize) {
             Ok(slice) => slice.ptr_guard_mut().as_ptr(),
             Err(err) => {
@@ -188,10 +202,22 @@ impl AsyncFileEngine {
             .map_err(|(io_uring_error, data)| RequestError {
                 req: data.req,
                 error: AsyncIoError::IoUring(io_uring_error),
-            })
+            })?;
+
+        debug!(
+            "AsyncFileEngine queued {:?} request desc_idx={} offset={} len={} pending_ops={}",
+            req_type,
+            desc_idx,
+            offset,
+            count,
+            self.pending_ops()
+        );
+        Ok(())
     }
 
     pub fn push_flush(&mut self, req: PendingRequest) -> Result<(), RequestError<AsyncIoError>> {
+        let req_type = req.request_type();
+        let desc_idx = req.desc_idx();
         let wrapped_user_data = WrappedRequest::new(req);
 
         self.ring
@@ -199,7 +225,15 @@ impl AsyncFileEngine {
             .map_err(|(io_uring_error, data)| RequestError {
                 req: data.req,
                 error: AsyncIoError::IoUring(io_uring_error),
-            })
+            })?;
+
+        debug!(
+            "AsyncFileEngine queued {:?} request desc_idx={} pending_ops={}",
+            req_type,
+            desc_idx,
+            self.pending_ops()
+        );
+        Ok(())
     }
 
     pub fn kick_submission_queue(&mut self) -> Result<(), AsyncIoError> {
