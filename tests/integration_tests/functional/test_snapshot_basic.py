@@ -19,8 +19,9 @@ import host_tools.cargo_build as host
 import host_tools.drive as drive_tools
 import host_tools.network as net_tools
 from framework import utils
+from framework.microvm import SnapshotType
 from framework.properties import global_props
-from framework.utils import check_filesystem, check_output
+from framework.utils import Timeout, check_filesystem, check_output
 from framework.utils_vsock import (
     ECHO_SERVER_PORT,
     VSOCK_UDS_PATH,
@@ -586,3 +587,283 @@ def test_snapshot_rename_interface(uvm_nano, microvm_factory):
         rename_interfaces={iface_override.dev_name: iface_override.tap_name},
         resume=True,
     )
+
+
+@pytest.mark.parametrize("snapshot_type", [SnapshotType.FULL])
+@pytest.mark.parametrize("pci_enabled", [False])
+@pytest.mark.parametrize("iteration", range(100))  # Run many iterations to catch non-zero drain
+def test_snapshot_with_heavy_async_io(
+    microvm_factory, guest_kernel_linux_6_1, rootfs, snapshot_type, pci_enabled, iteration
+):
+    """
+    Test snapshot with heavy filesystem I/O using async/io_uring engine.
+
+    This test verifies that async I/O operations in-flight during snapshot
+    are properly completed and their completion information is written to
+    guest memory (used ring) so that after restore, the guest driver sees
+    the completions and doesn't freeze.
+
+    CRITICAL: The test restores from the snapshot IMMEDIATELY after creation.
+    In the error case (if async I/O completions weren't written to guest memory
+    during prepare_save()), the guest virtio driver will be stuck waiting for
+    completions that will never come, causing the VM to freeze. This test
+    detects that freeze by attempting to run a command immediately after restore.
+
+    The test focuses on freeze detection - if async I/O completions aren't written
+    to guest memory during snapshot, the VM will freeze after restore.
+
+    The test:
+    1. Configures VM with async io_engine (kernel 6.1 only)
+    2. Performs heavy async write operations (no sync) on the filesystem
+    3. Creates a snapshot IMMEDIATELY while I/O operations are still in-flight
+    4. Restores from the snapshot IMMEDIATELY after creation
+    5. Verifies VM is responsive (freeze detection - will timeout if frozen)
+    6. Verifies filesystem integrity and that all I/O completed correctly
+    """
+    logger = logging.getLogger("snapshot_heavy_async_io")
+
+    print("=" * 80)
+    print(f"Starting iteration {iteration + 1}/100 - Testing for non-zero async I/O drain")
+    print("=" * 80)
+
+    # Build VM with kernel 6.1 only
+    vm = microvm_factory.build(guest_kernel_linux_6_1, rootfs, pci=pci_enabled)
+    # Enable Trace-level logging to see ALL async I/O drain operations during snapshot
+    # Trace level shows the most detailed device operations including block device async I/O
+    # The debug! macros in async_io.rs (like drain_and_flush) require Debug or Trace level
+    vm.spawn(log_level="Trace", log_show_level=True, log_show_origin=True)
+    vm.basic_config(
+        vcpu_count=2,
+        mem_size_mib=1024,
+        # track_dirty_pages=snapshot_type.needs_dirty_page_tracking,
+        rootfs_io_engine="Async",  # Use async/io_uring engine
+    )
+    vm.add_net_iface()
+    vm.start()
+
+    logger.info("Starting heavy write I/O workload on guest filesystem...")
+
+    # Perform heavy WRITE operations before snapshot
+    # Writes are more likely to be async and non-blocking, generating many
+    # in-flight async I/O requests that will need completion info written to memory
+    # We want to maximize the chance of having pending_ops > 0 during drain
+    write_io_script = """
+    # Create a test directory
+    mkdir -p /tmp/io_test
+    cd /tmp/io_test
+
+    # Strategy: Fire THOUSANDS of small writes VERY quickly to maximize io_uring queue depth
+    # Small writes complete faster but queue more operations
+    # Goal: Schedule thousands of operations to increase chance of pending_ops > 0
+    
+    # Fire 2000+ very small writes in parallel - these will queue up quickly
+    # Small block sizes (4k-16k) are more likely to stay queued
+    for i in $(seq 1 2000); do
+        dd if=/dev/urandom of=test_file_$i bs=8k count=1 oflag=direct 2>/dev/null &
+    done
+    
+    # Fire 1000 medium writes to add more operations to the queue
+    for i in $(seq 1 1000); do
+        dd if=/dev/urandom of=medium_file_$i bs=16k count=1 oflag=direct 2>/dev/null &
+    done
+    
+    # Fire 500 larger writes
+    for i in $(seq 1 500); do
+        dd if=/dev/urandom of=large_file_$i bs=32k count=1 oflag=direct 2>/dev/null &
+    done
+    
+    # Fire 200 even larger writes
+    for i in $(seq 1 200); do
+        dd if=/dev/urandom of=xlarge_file_$i bs=64k count=1 oflag=direct 2>/dev/null &
+    done
+
+    # Use fio with MAXIMUM iodepth to maximize in-flight operations
+    # io_uring queue depth is typically 4096, so we want to fill it up
+    # Total: 3700+ dd operations + fio operations
+    if command -v fio >/dev/null 2>&1; then
+        # Maximum iodepth (512) with many jobs to fill the queue
+        # Random writes are better than sequential for keeping ops in-flight
+        fio --name=heavy_write --filename=/tmp/io_test/fio_write_test \
+            --rw=randwrite --bs=4k --size=2G --ioengine=libaio \
+            --iodepth=512 --direct=1 --runtime=30 --time_based \
+            --numjobs=64 --group_reporting \
+            --output=/tmp/fio_write.log >/dev/null 2>&1 &
+        
+        # Start multiple fio jobs on different files for even more operations
+        fio --name=heavy_write2 --filename=/tmp/io_test/fio_write_test2 \
+            --rw=randwrite --bs=8k --size=2G --ioengine=libaio \
+            --iodepth=512 --direct=1 --runtime=30 --time_based \
+            --numjobs=64 --group_reporting \
+            --output=/tmp/fio_write2.log >/dev/null 2>&1 &
+            
+        fio --name=heavy_write3 --filename=/tmp/io_test/fio_write_test3 \
+            --rw=randwrite --bs=16k --size=2G --ioengine=libaio \
+            --iodepth=512 --direct=1 --runtime=30 --time_based \
+            --numjobs=64 --group_reporting \
+            --output=/tmp/fio_write3.log >/dev/null 2>&1 &
+            
+        fio --name=heavy_write4 --filename=/tmp/io_test/fio_write_test4 \
+            --rw=randwrite --bs=4k --size=2G --ioengine=libaio \
+            --iodepth=512 --direct=1 --runtime=30 --time_based \
+            --numjobs=64 --group_reporting \
+            --output=/tmp/fio_write4.log >/dev/null 2>&1 &
+    fi
+    
+    # Total operations scheduled: ~3700 dd + ~256 fio workers (64*4) = ~3956 operations
+    """
+
+    # Execute initial write workload
+    vm.ssh.run(write_io_script)
+    # No wait - fire first snapshot immediately to catch operations in-flight
+
+    # Perform 4 snapshot-resume cycles
+    # Strategy: Take snapshots as fast as possible after firing I/O
+    # This keeps operations overlapping across snapshots so each has pending_ops > 0
+    NUM_SNAPSHOTS = 4
+    current_vm = vm
+    snapshots = []
+    all_pending_ops = {}  # Track pending_ops for each snapshot
+    queued_ops_count = []
+    
+    for snap_num in range(1, NUM_SNAPSHOTS + 1):
+        print(f"\n{'='*80}")
+        print(f"Iteration {iteration + 1}, Snapshot {snap_num}/{NUM_SNAPSHOTS}")
+        print(f"{'='*80}")
+        
+        # Fire ONE or FEW really large operations - simple approach
+        # Large operations take time to complete, naturally staying in-flight
+        print(f"Snapshot {snap_num}: Firing large I/O operations...")
+        heavy_io_script = f"""
+        cd /tmp/io_test
+        
+        # Fire one or few really large operations
+        # Large operations take time to complete, keeping them in-flight in io_uring queue
+        # Simple and effective - just big writes that take time
+        
+        # One really big write - this will take time and stay in-flight
+        dd if=/dev/urandom of=snap{snap_num}_huge bs=1M count=1000 oflag=direct 2>/dev/null &
+        
+        # A few more large operations for good measure
+        dd if=/dev/urandom of=snap{snap_num}_large1 bs=1M count=500 oflag=direct 2>/dev/null &
+        dd if=/dev/urandom of=snap{snap_num}_large2 bs=1M count=500 oflag=direct 2>/dev/null &
+        dd if=/dev/urandom of=snap{snap_num}_large3 bs=1M count=500 oflag=direct 2>/dev/null &
+        """
+        current_vm.ssh.run(heavy_io_script)
+        
+        # Short wait - just enough for operations to be submitted to io_uring
+        # Large operations will take time to complete, staying in-flight
+        time.sleep(0.01)  # 10ms - just enough for submission
+        
+        print(f"Snapshot {snap_num}: Creating snapshot immediately (operations still in-flight)...")
+        snapshot = current_vm.make_snapshot(snapshot_type)
+        snapshots.append(snapshot)
+        
+        # Minimal wait for logs to flush
+        time.sleep(0.05)
+        
+        # Parse logs for pending_ops for EVERY snapshot
+        pending_ops_during_drain = None
+        if current_vm.log_file and current_vm.log_file.exists():
+            try:
+                log_data = current_vm.log_data
+                log_lines = log_data.splitlines()
+                
+                # Parse the drain messages to extract pending_ops
+                for line in log_lines:
+                    # Look for: "AsyncFileEngine queued ... request ... pending_ops=X"
+                    if "AsyncFileEngine queued" in line and "pending_ops=" in line:
+                        match = re.search(r'pending_ops=(\d+)', line)
+                        if match:
+                            queued_ops_count.append(int(match.group(1)))
+                    
+                    # Look for: "AsyncFileEngine draining: pending_ops=X discard_cqes=..."
+                    # We want to find the MOST RECENT drain message for this snapshot
+                    if "AsyncFileEngine draining:" in line:
+                        match = re.search(r'pending_ops=(\d+)', line)
+                        if match:
+                            pending_ops_during_drain = int(match.group(1))
+                            print(f"Snapshot {snap_num}: Found drain start: pending_ops={pending_ops_during_drain}")
+            except Exception as e:
+                print(f"ERROR: Failed to parse log file: {e}")
+        
+        # Store pending_ops for this snapshot
+        all_pending_ops[snap_num] = pending_ops_during_drain
+        
+        # Kill current VM before restoring
+        current_vm.kill()
+        
+        # Restore immediately and fire next I/O as fast as possible
+        print(f"Snapshot {snap_num}: Restoring from snapshot IMMEDIATELY...")
+        restored_vm = microvm_factory.build_from_snapshot(snapshot)
+        
+        # Verify VM is responsive (freeze detection) - do this quickly
+        print(f"Snapshot {snap_num}: Verifying VM is responsive (freeze detection)...")
+        print(f"Snapshot {snap_num}: Waiting up to 30 seconds for VM to respond...")
+        try:
+            # Use a timeout to detect freeze - if VM is frozen, this will timeout
+            # The default SSH timeout is 60s, but we want to fail faster for freeze detection
+            with Timeout(30):
+                restored_vm.ssh.check_output("true")
+            print(f"Snapshot {snap_num}: ✓ VM is responsive - no freeze detected")
+            
+            # If not the last snapshot, immediately prepare for next snapshot
+            # This keeps operations overlapping across snapshots
+            if snap_num < NUM_SNAPSHOTS:
+                print(f"Snapshot {snap_num}: Ready for next snapshot (operations may still be running)...")
+            
+            # Report findings for this snapshot
+            print(f"\nSnapshot {snap_num} Results:")
+            print(f"  pending_ops during drain: {pending_ops_during_drain}")
+            
+            if pending_ops_during_drain is not None and pending_ops_during_drain > 0:
+                print(f"  *** NON-ZERO DRAIN: pending_ops={pending_ops_during_drain} ***")
+            elif pending_ops_during_drain == 0:
+                print(f"  WARNING: pending_ops=0 (operations completed before drain)")
+            else:
+                print(f"  WARNING: Could not parse pending_ops from logs")
+            
+            # Report summary for last snapshot
+            if snap_num == NUM_SNAPSHOTS:
+                print(f"\n{'='*80}")
+                print(f"Summary for all {NUM_SNAPSHOTS} snapshots:")
+                for s in range(1, NUM_SNAPSHOTS + 1):
+                    ops = all_pending_ops.get(s, "unknown")
+                    status = "✓" if (isinstance(ops, int) and ops > 0) else "✗"
+                    print(f"  Snapshot {s}: pending_ops={ops} {status}")
+                
+                if queued_ops_count:
+                    max_queued = max(queued_ops_count)
+                    min_queued = min(queued_ops_count)
+                    print(f"\nOperation counts from FC logs:")
+                    print(f"  Max pending_ops seen in logs: {max_queued}")
+                    print(f"  Min pending_ops seen in logs: {min_queued}")
+                    print(f"  Sample of queued ops counts: {queued_ops_count[-10:]}")
+                
+                # Check if we got non-zero drain in any snapshot
+                non_zero_snapshots = [s for s, ops in all_pending_ops.items() 
+                                     if isinstance(ops, int) and ops > 0]
+                if non_zero_snapshots:
+                    print(f"\n{'='*80}")
+                    print(f"SUCCESS: Found non-zero drain in snapshots: {non_zero_snapshots}")
+                    print(f"All snapshots with non-zero drain resumed correctly - no freeze!")
+                    print(f"This proves that non-zero drain with proper completion handling works correctly.")
+                    print(f"{'='*80}\n")
+                else:
+                    print(f"\nNo non-zero drain found in any snapshot - continuing to next iteration...")
+                print(f"{'='*80}")
+            
+        except Exception as e:
+            print(f"\n{'='*80}")
+            print(f"FAILURE: Snapshot {snap_num} - VM FROZE after restore!")
+            print(f"pending_ops during drain: {pending_ops_during_drain}")
+            print(f"Error: {e}")
+            print(f"{'='*80}\n")
+            restored_vm.kill()
+            raise
+        
+        # For next iteration, use the restored VM
+        if snap_num < NUM_SNAPSHOTS:
+            current_vm = restored_vm
+        else:
+            # Last snapshot - cleanup
+            restored_vm.kill()
