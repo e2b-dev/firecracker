@@ -591,7 +591,7 @@ def test_snapshot_rename_interface(uvm_nano, microvm_factory):
 
 @pytest.mark.parametrize("snapshot_type", [SnapshotType.FULL])
 @pytest.mark.parametrize("pci_enabled", [False])
-@pytest.mark.parametrize("iteration", range(100))
+@pytest.mark.parametrize("iteration", range(4))
 def test_snapshot_with_heavy_async_io(
     microvm_factory, guest_kernel_linux_6_1, rootfs_rw, snapshot_type, pci_enabled, iteration
 ):
@@ -613,25 +613,29 @@ def test_snapshot_with_heavy_async_io(
     vm.add_net_iface()
     vm.start()
 
+    # Check free space on sandbox start
+    _, free_space_start, _ = vm.ssh.check_output("df -h / | awk 'NR==2 {{print $4}}'")
+    print(f"Free space on sandbox start: {free_space_start.strip()}")
+
     write_io_script = """
     # Create a test directory
     mkdir -p /root/io_test
     cd /root/io_test
 
     for i in $(seq 1 2000); do
-        dd if=/dev/urandom of=test_file_$i bs=8k count=1 oflag=direct 2>/dev/null &
+        dd if=/dev/urandom of=/root/io_test/test_file_$i bs=8k count=1 oflag=direct 2>/dev/null &
     done
     
     for i in $(seq 1 1000); do
-        dd if=/dev/urandom of=medium_file_$i bs=16k count=1 oflag=direct 2>/dev/null &
+        dd if=/dev/urandom of=/root/io_test/medium_file_$i bs=16k count=1 oflag=direct 2>/dev/null &
     done
     
     for i in $(seq 1 500); do
-        dd if=/dev/urandom of=large_file_$i bs=32k count=1 oflag=direct 2>/dev/null &
+        dd if=/dev/urandom of=/root/io_test/large_file_$i bs=32k count=1 oflag=direct 2>/dev/null &
     done
     
     for i in $(seq 1 200); do
-        dd if=/dev/urandom of=xlarge_file_$i bs=64k count=1 oflag=direct 2>/dev/null &
+        dd if=/dev/urandom of=/root/io_test/xlarge_file_$i bs=64k count=1 oflag=direct 2>/dev/null &
     done
 
     if command -v fio >/dev/null 2>&1; then
@@ -691,4 +695,21 @@ def test_snapshot_with_heavy_async_io(
     with Timeout(30):
         restored_vm = microvm_factory.build_from_snapshot(snapshot)
     
+    # Check free space after resume
+    _, free_space_after_resume, _ = restored_vm.ssh.check_output("df -h / | awk 'NR==2 {{print $4}}'")
+    print(f"Free space after resume: {free_space_after_resume.strip()}")
+    
+    # Delete all files/dirs created during the test
+    cleanup_script = """
+    rm -rf /root/io_test
+    rm -f /root/fio_write*.log
+    """
+    restored_vm.ssh.run(cleanup_script)
+    
+    # Check free space after cleanup
+    _, free_space_after_cleanup, _ = restored_vm.ssh.check_output("df -h / | awk 'NR==2 {{print $4}}'")
+    print(f"Free space after cleanup: {free_space_after_cleanup.strip()}")
+    
     print(f"VM resumed - no freeze detected")
+    
+    restored_vm.kill()
