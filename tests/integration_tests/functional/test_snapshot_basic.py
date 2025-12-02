@@ -591,7 +591,7 @@ def test_snapshot_rename_interface(uvm_nano, microvm_factory):
 
 @pytest.mark.parametrize("snapshot_type", [SnapshotType.FULL])
 @pytest.mark.parametrize("pci_enabled", [False])
-@pytest.mark.parametrize("iteration", range(4))
+@pytest.mark.parametrize("iteration", range(100))
 def test_snapshot_with_heavy_async_io(
     microvm_factory, guest_kernel_linux_6_1, rootfs_rw, snapshot_type, pci_enabled, iteration
 ):
