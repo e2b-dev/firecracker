@@ -14,7 +14,7 @@ use crate::devices::virtio::block::virtio::{IO_URING_NUM_ENTRIES, PendingRequest
 use crate::io_uring::operation::{Cqe, OpCode, Operation};
 use crate::io_uring::restriction::Restriction;
 use crate::io_uring::{IoUring, IoUringError};
-use crate::logger::log_dev_preview_warning;
+use crate::logger::{debug, log_dev_preview_warning};
 use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -119,6 +119,10 @@ impl AsyncFileEngine {
         &self.completion_evt
     }
 
+    pub fn pending_ops(&self) -> u32 {
+        self.ring.num_ops()
+    }
+
     pub fn push_read(
         &mut self,
         offset: u64,
@@ -127,6 +131,8 @@ impl AsyncFileEngine {
         count: u32,
         req: PendingRequest,
     ) -> Result<(), RequestError<AsyncIoError>> {
+        let req_type = req.request_type();
+        let desc_idx = req.desc_idx();
         let buf = match mem.get_slice(addr, count as usize) {
             Ok(slice) => slice.ptr_guard_mut().as_ptr(),
             Err(err) => {
@@ -150,7 +156,17 @@ impl AsyncFileEngine {
             .map_err(|(io_uring_error, data)| RequestError {
                 req: data.req,
                 error: AsyncIoError::IoUring(io_uring_error),
-            })
+            })?;
+
+        debug!(
+            "AsyncFileEngine queued {:?} request desc_idx={} offset={} len={} pending_ops={}",
+            req_type,
+            desc_idx,
+            offset,
+            count,
+            self.pending_ops()
+        );
+        Ok(())
     }
 
     pub fn push_write(
@@ -161,6 +177,8 @@ impl AsyncFileEngine {
         count: u32,
         req: PendingRequest,
     ) -> Result<(), RequestError<AsyncIoError>> {
+        let req_type = req.request_type();
+        let desc_idx = req.desc_idx();
         let buf = match mem.get_slice(addr, count as usize) {
             Ok(slice) => slice.ptr_guard_mut().as_ptr(),
             Err(err) => {
@@ -184,10 +202,22 @@ impl AsyncFileEngine {
             .map_err(|(io_uring_error, data)| RequestError {
                 req: data.req,
                 error: AsyncIoError::IoUring(io_uring_error),
-            })
+            })?;
+
+        debug!(
+            "AsyncFileEngine queued {:?} request desc_idx={} offset={} len={} pending_ops={}",
+            req_type,
+            desc_idx,
+            offset,
+            count,
+            self.pending_ops()
+        );
+        Ok(())
     }
 
     pub fn push_flush(&mut self, req: PendingRequest) -> Result<(), RequestError<AsyncIoError>> {
+        let req_type = req.request_type();
+        let desc_idx = req.desc_idx();
         let wrapped_user_data = WrappedRequest::new(req);
 
         self.ring
@@ -195,7 +225,15 @@ impl AsyncFileEngine {
             .map_err(|(io_uring_error, data)| RequestError {
                 req: data.req,
                 error: AsyncIoError::IoUring(io_uring_error),
-            })
+            })?;
+
+        debug!(
+            "AsyncFileEngine queued {:?} request desc_idx={} pending_ops={}",
+            req_type,
+            desc_idx,
+            self.pending_ops()
+        );
+        Ok(())
     }
 
     pub fn kick_submission_queue(&mut self) -> Result<(), AsyncIoError> {
@@ -220,12 +258,26 @@ impl AsyncFileEngine {
     }
 
     pub fn drain_and_flush(&mut self, discard_cqes: bool) -> Result<(), AsyncIoError> {
+        let pending_before = self.pending_ops();
+        debug!(
+            "AsyncFileEngine draining: pending_ops={} discard_cqes={}",
+            pending_before, discard_cqes
+        );
         self.drain(discard_cqes)?;
+        debug!(
+            "AsyncFileEngine drain complete: pending_ops={} (discard_cqes={})",
+            self.pending_ops(),
+            discard_cqes
+        );
 
         // Sync data out to physical media on host.
         // We don't need to call flush first since all the ops are performed through io_uring
         // and Rust shouldn't manage any data in its internal buffers.
         self.file.sync_all().map_err(AsyncIoError::SyncAll)?;
+        debug!(
+            "AsyncFileEngine sync complete: pending_ops={}",
+            self.pending_ops()
+        );
 
         Ok(())
     }

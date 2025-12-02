@@ -82,10 +82,10 @@ impl Block {
         }
     }
 
-    pub fn prepare_save(&mut self) {
+    pub fn prepare_save(&mut self) -> Result<(), BlockError> {
         match self {
-            Self::Virtio(b) => b.prepare_save(),
-            Self::VhostUser(b) => b.prepare_save(),
+            Self::Virtio(b) => b.prepare_save().map_err(BlockError::VirtioBackend),
+            Self::VhostUser(_) => Err(BlockError::InvalidBlockBackend),
         }
     }
 

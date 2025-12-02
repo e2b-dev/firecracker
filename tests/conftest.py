@@ -26,6 +26,7 @@ import platform
 import shutil
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
@@ -502,10 +503,37 @@ def rootfs():
     return disks("ubuntu-24.04.squashfs")[0]
 
 
-@pytest.fixture
+@pytest.fixture(scope="function")
 def rootfs_rw():
-    """Return an Ubuntu 24.04 ext4 rootfs"""
-    return disks("ubuntu-24.04.ext4")[0]
+    """Return an Ubuntu 24.04 ext4 rootfs, resized to 20GB for each test"""
+    original_rootfs = disks("ubuntu-24.04.ext4")[0]
+    original_ssh_key = original_rootfs.with_suffix(".id_rsa")
+    
+    # Create a unique resized copy for this test
+    unique_id = str(uuid.uuid4())[:8]
+    resized_rootfs_path = Path(tempfile.gettempdir()) / f"rootfs_rw_{unique_id}.ext4"
+    resized_ssh_key_path = resized_rootfs_path.with_suffix(".id_rsa")
+    
+    # Copy the original rootfs
+    shutil.copyfile(original_rootfs, resized_rootfs_path)
+    
+    # Copy the SSH key
+    if original_ssh_key.exists():
+        shutil.copyfile(original_ssh_key, resized_ssh_key_path)
+    
+    # Resize to 20GB
+    new_size_bytes = 20 * 1024 * 1024 * 1024
+    os.truncate(resized_rootfs_path, new_size_bytes)
+    utils.check_output(f"e2fsck -f -y {resized_rootfs_path}")
+    utils.check_output(f"resize2fs {resized_rootfs_path}")
+    
+    yield resized_rootfs_path
+    
+    # Cleanup: remove the resized rootfs file and SSH key after the test
+    if resized_rootfs_path.exists():
+        resized_rootfs_path.unlink()
+    if resized_ssh_key_path.exists():
+        resized_ssh_key_path.unlink()
 
 
 @pytest.fixture

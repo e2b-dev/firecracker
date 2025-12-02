@@ -19,8 +19,9 @@ import host_tools.cargo_build as host
 import host_tools.drive as drive_tools
 import host_tools.network as net_tools
 from framework import utils
+from framework.microvm import SnapshotType
 from framework.properties import global_props
-from framework.utils import check_filesystem, check_output
+from framework.utils import Timeout, check_filesystem, check_output
 from framework.utils_vsock import (
     ECHO_SERVER_PORT,
     VSOCK_UDS_PATH,
@@ -586,3 +587,129 @@ def test_snapshot_rename_interface(uvm_nano, microvm_factory):
         rename_interfaces={iface_override.dev_name: iface_override.tap_name},
         resume=True,
     )
+
+
+@pytest.mark.parametrize("snapshot_type", [SnapshotType.FULL])
+@pytest.mark.parametrize("pci_enabled", [False])
+@pytest.mark.parametrize("iteration", range(100))
+def test_snapshot_with_heavy_async_io(
+    microvm_factory, guest_kernel_linux_6_1, rootfs_rw, snapshot_type, pci_enabled, iteration
+):
+    print("=" * 80)
+    print(f"Starting iteration {iteration + 1}/100 - Testing for non-zero async I/O drain")
+    print("=" * 80)
+
+    # CHECK: if we set `rootfs` to just "rootfs" (readonly) it also freezes on async.
+    # By default though, even the rw rootfs has only like 37MB of free space.
+    vm = microvm_factory.build(guest_kernel_linux_6_1, rootfs_rw, pci=pci_enabled)
+
+    vm.spawn(log_level="Trace", log_show_level=True, log_show_origin=True)
+    vm.basic_config(
+        vcpu_count=2,
+        mem_size_mib=1024,
+        # CHECK: If we set this to "Sync", it will not freeze.
+        rootfs_io_engine="Async",
+    )
+    vm.add_net_iface()
+    vm.start()
+
+    # Check free space on sandbox start
+    _, free_space_start, _ = vm.ssh.check_output("df -h / | awk 'NR==2 {{print $4}}'")
+    print(f"Free space on sandbox start: {free_space_start.strip()}")
+
+    write_io_script = """
+    # Create a test directory
+    mkdir -p /root/io_test
+    cd /root/io_test
+
+    for i in $(seq 1 2000); do
+        dd if=/dev/urandom of=/root/io_test/test_file_$i bs=8k count=1 oflag=direct 2>/dev/null &
+    done
+    
+    for i in $(seq 1 1000); do
+        dd if=/dev/urandom of=/root/io_test/medium_file_$i bs=16k count=1 oflag=direct 2>/dev/null &
+    done
+    
+    for i in $(seq 1 500); do
+        dd if=/dev/urandom of=/root/io_test/large_file_$i bs=32k count=1 oflag=direct 2>/dev/null &
+    done
+    
+    for i in $(seq 1 200); do
+        dd if=/dev/urandom of=/root/io_test/xlarge_file_$i bs=64k count=1 oflag=direct 2>/dev/null &
+    done
+
+    if command -v fio >/dev/null 2>&1; then
+        fio --name=heavy_write --filename=/root/io_test/fio_write_test \
+            --rw=randwrite --bs=4k --size=2G --ioengine=libaio \
+            --iodepth=512 --direct=1 --runtime=30 --time_based \
+            --numjobs=2 --group_reporting \
+            --output=/root/fio_write.log >/dev/null 2>&1 &
+        
+        fio --name=heavy_write2 --filename=/root/io_test/fio_write_test2 \
+            --rw=randwrite --bs=8k --size=2G --ioengine=libaio \
+            --iodepth=512 --direct=1 --runtime=30 --time_based \
+            --numjobs=2 --group_reporting \
+            --output=/root/fio_write2.log >/dev/null 2>&1 &
+            
+        fio --name=heavy_write3 --filename=/root/io_test/fio_write_test3 \
+            --rw=randwrite --bs=16k --size=2G --ioengine=libaio \
+            --iodepth=512 --direct=1 --runtime=30 --time_based \
+            --numjobs=2 --group_reporting \
+            --output=/root/fio_write3.log >/dev/null 2>&1 &
+            
+        fio --name=heavy_write4 --filename=/root/io_test/fio_write_test4 \
+            --rw=randwrite --bs=4k --size=2G --ioengine=libaio \
+            --iodepth=512 --direct=1 --runtime=30 --time_based \
+            --numjobs=2 --group_reporting \
+            --output=/root/fio_write4.log >/dev/null 2>&1 &
+    fi
+    """
+
+    vm.ssh.run(write_io_script)
+
+    # if set to cca 2 seconds it stops freezing for Async.
+    time.sleep(0.01)
+    
+    snapshot = vm.make_snapshot(snapshot_type)
+    
+    time.sleep(0.05)
+    
+    if vm.log_file and vm.log_file.exists():
+        try:
+            log_data = vm.log_data
+            log_lines = log_data.splitlines()
+            
+            for line in log_lines:
+                if "AsyncFileEngine draining:" in line:
+                    match = re.search(r'pending_ops=(\d+)', line)
+                    if match:
+                        pending_ops_during_drain = int(match.group(1))
+                        print(f"DRAIN: pending_ops={pending_ops_during_drain}")
+
+        except Exception as e:
+            print(f"ERROR: Failed to parse log file: {e}")
+    
+    vm.kill()
+    
+    print(f"Restoring from snapshot...")
+    with Timeout(30):
+        restored_vm = microvm_factory.build_from_snapshot(snapshot)
+    
+    # Check free space after resume
+    _, free_space_after_resume, _ = restored_vm.ssh.check_output("df -h / | awk 'NR==2 {{print $4}}'")
+    print(f"Free space after resume: {free_space_after_resume.strip()}")
+    
+    # Delete all files/dirs created during the test
+    cleanup_script = """
+    rm -rf /root/io_test
+    rm -f /root/fio_write*.log
+    """
+    restored_vm.ssh.run(cleanup_script)
+    
+    # Check free space after cleanup
+    _, free_space_after_cleanup, _ = restored_vm.ssh.check_output("df -h / | awk 'NR==2 {{print $4}}'")
+    print(f"Free space after cleanup: {free_space_after_cleanup.strip()}")
+    
+    print(f"VM resumed - no freeze detected")
+    
+    restored_vm.kill()

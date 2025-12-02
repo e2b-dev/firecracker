@@ -35,7 +35,7 @@ use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use crate::devices::virtio::queue::{InvalidAvailIdx, Queue};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::impl_device_type;
-use crate::logger::{IncMetric, error, warn};
+use crate::logger::{IncMetric, debug, error, warn};
 use crate::rate_limiter::{BucketUpdate, RateLimiter};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::RateLimiterConfig;
@@ -474,6 +474,12 @@ impl VirtioBlock {
         // This is safe since we checked in the event handler that the device is activated.
         let active_state = self.device_state.active_state().unwrap();
         let queue = &mut self.queues[0];
+        let mut processed = 0_u32;
+        let pending_before = engine.pending_ops();
+        debug!(
+            "virtio-block '{}' starting async completion drain: pending_ops={}",
+            self.id, pending_before
+        );
 
         loop {
             match engine.pop(&active_state.mem) {
@@ -504,6 +510,7 @@ impl VirtioBlock {
                                 finished.desc_idx, err
                             )
                         });
+                    processed = processed.saturating_add(1);
                 }
             }
         }
@@ -517,6 +524,12 @@ impl VirtioBlock {
                     self.metrics.event_fails.inc();
                 });
         }
+        debug!(
+            "virtio-block '{}' processed {} io_uring completions; pending_ops={} after drain",
+            self.id,
+            processed,
+            engine.pending_ops()
+        );
     }
 
     pub fn process_async_completion_event(&mut self) {
@@ -563,22 +576,48 @@ impl VirtioBlock {
         }
     }
 
-    fn drain_and_flush(&mut self, discard: bool) {
-        if let Err(err) = self.disk.file_engine.drain_and_flush(discard) {
-            error!("Failed to drain ops and flush block data: {:?}", err);
-        }
+    fn drain_and_flush(&mut self, discard: bool) -> Result<(), VirtioBlockError> {
+        self.disk
+            .file_engine
+            .drain_and_flush(discard)
+            .map_err(VirtioBlockError::FileEngine)
     }
 
     /// Prepare device for being snapshotted.
-    pub fn prepare_save(&mut self) {
+    pub fn prepare_save(&mut self) -> Result<(), VirtioBlockError> {
         if !self.is_activated() {
-            return;
+            debug!(
+                "virtio-block '{}' prepare_save skipped (device inactive)",
+                self.id
+            );
+            return Ok(());
         }
 
-        self.drain_and_flush(false);
-        if let FileEngine::Async(ref _engine) = self.disk.file_engine {
+        debug!(
+            "virtio-block '{}' draining outstanding IO before snapshot",
+            self.id
+        );
+        self.drain_and_flush(false)?;
+        let is_async = matches!(self.disk.file_engine, FileEngine::Async(_));
+        if is_async {
             self.process_async_completion_queue();
+            if let FileEngine::Async(ref engine) = self.disk.file_engine {
+                let pending = engine.pending_ops();
+                debug!(
+                    "virtio-block '{}' prepare_save async pending_ops after drain: {}",
+                    self.id, pending
+                );
+                if pending != 0 {
+                    return Err(VirtioBlockError::PendingAsyncOperations(pending));
+                }
+            }
         }
+
+        debug!(
+            "virtio-block '{}' prepare_save finished; async backend drained",
+            self.id
+        );
+        Ok(())
     }
 }
 
@@ -682,7 +721,9 @@ impl Drop for VirtioBlock {
                 }
             }
             CacheType::Writeback => {
-                self.drain_and_flush(true);
+                if let Err(err) = self.drain_and_flush(true) {
+                    error!("Failed to drain ops and flush block data: {:?}", err);
+                }
             }
         };
     }
@@ -1673,7 +1714,7 @@ mod tests {
             // Add a batch of flush requests.
             add_flush_requests_batch(&mut block, &vq, 5);
             simulate_queue_event(&mut block, None);
-            block.prepare_save();
+            block.prepare_save().unwrap();
 
             // Check that all the pending flush requests were processed during `prepare_save()`.
             check_flush_requests_batch(5, &vq);

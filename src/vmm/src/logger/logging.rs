@@ -17,7 +17,7 @@ use super::metrics::{IncMetric, METRICS};
 
 /// Default level filter for logger matching the swagger specification
 /// (`src/firecracker/swagger/firecracker.yaml`).
-pub const DEFAULT_LEVEL: log::LevelFilter = log::LevelFilter::Info;
+pub const DEFAULT_LEVEL: log::LevelFilter = log::LevelFilter::Debug;
 /// Default instance id.
 pub const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
 /// Instance id.
