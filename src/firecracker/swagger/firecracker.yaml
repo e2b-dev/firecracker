@@ -1224,7 +1224,7 @@ definitions:
   SnapshotCreateParams:
     type: object
     required:
-      - mem_file_path
+      - snapshot_path
     properties:
       mem_file_path:
         type: string
