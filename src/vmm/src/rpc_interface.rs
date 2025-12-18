@@ -26,7 +26,7 @@ use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
 use crate::vmm_config::instance_info::{InstanceInfo, MemoryMappingsResponse, MemoryResponse};
-use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
+use crate::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate, VmConfigError};
 use crate::vmm_config::metrics::{MetricsConfig, MetricsConfigError};
 use crate::vmm_config::mmds::{MmdsConfig, MmdsConfigError};
 use crate::vmm_config::net::{
@@ -662,9 +662,7 @@ impl RuntimeApiController {
             }
             GetMemoryMappings => {
                 let locked_vmm = self.vmm.lock().expect("Poisoned lock");
-                let mappings = locked_vmm
-                    .vm
-                    .guest_memory_mappings(&VmInfo::from(&self.vm_resources));
+                let mappings = locked_vmm.guest_memory_mappings(&VmInfo::from(&self.vm_resources));
 
                 Ok(VmmData::MemoryMappings(MemoryMappingsResponse { mappings }))
             }
@@ -672,7 +670,10 @@ impl RuntimeApiController {
                 let locked_vmm = self.vmm.lock().expect("Poisoned lock");
                 let (resident_bitmap, empty_bitmap) = locked_vmm
                     .vm
-                    .get_memory_info(&VmInfo::from(&self.vm_resources))
+                    .get_memory_info(
+                        &locked_vmm.guest_memory(),
+                        &VmInfo::from(&self.vm_resources),
+                    )
                     .map_err(|e| VmmActionError::InternalVmm(VmmError::Vm(e)))?;
                 Ok(VmmData::Memory(MemoryResponse {
                     resident: resident_bitmap,

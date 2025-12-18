@@ -8,21 +8,12 @@
 #[cfg(target_arch = "x86_64")]
 use std::fmt;
 
-use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
-use kvm_ioctls::VmFd;
-use serde::{Deserialize, Serialize};
-use vmm_sys_util::eventfd::EventFd;
-
-use crate::arch::host_page_size;
-pub use crate::arch::{ArchVm as Vm, ArchVmError, VmState};
-use crate::logger::info;
-use crate::persist::{CreateSnapshotError, VmInfo};
-use crate::utils::u64_to_usize;
-use crate::vmm_config::snapshot::SnapshotType;
-use crate::vstate::memory::{
-    Address, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
+use kvm_bindings::{
+    kvm_clock_data, kvm_irqchip, kvm_pit_config, kvm_pit_state2, kvm_userspace_memory_region,
+    CpuId, MsrList, KVM_API_VERSION, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC,
+    KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_MAX_CPUID_ENTRIES, KVM_MEM_LOG_DIRTY_PAGES,
+    KVM_PIT_SPEAKER_DUMMY,
 };
-use kvm_bindings::{kvm_userspace_memory_region, KVM_API_VERSION, KVM_MEM_LOG_DIRTY_PAGES};
 use kvm_ioctls::{Kvm, VmFd};
 use serde::{Deserialize, Serialize};
 
@@ -31,9 +22,16 @@ use crate::arch::aarch64::gic::GICDevice;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::gic::GicState;
 use crate::cpu_config::templates::KvmCapability;
-#[cfg(target_arch = "x86_64")]
-use crate::utils::u64_to_usize;
+use crate::persist::VmInfo;
+use crate::utils::{get_page_size, u64_to_usize};
 use crate::vstate::memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use crate::GuestMemoryRegionMapping;
+
+/// Get the host page size in bytes.
+/// This should always succeed on a valid system.
+fn host_page_size() -> usize {
+    get_page_size().expect("Failed to get system page size")
+}
 
 /// Errors associated with the wrappers over KVM ioctls.
 /// Needs `rustfmt::skip` to make multiline comments work
@@ -85,6 +83,8 @@ pub enum VmError {
     #[cfg(target_arch = "aarch64")]
     /// Failed to restore the VM's GIC state: {0}
     RestoreGic(crate::arch::aarch64::gic::GicError),
+    /// Invalid memory configuration: {0}
+    InvalidMemoryConfiguration(String),
 }
 
 /// Error type for [`Vm::restore_state`]
@@ -265,50 +265,35 @@ impl Vm {
     pub fn fd(&self) -> &VmFd {
         &self.fd
     }
-}
 
-#[cfg(target_arch = "aarch64")]
-impl Vm {
-    const DEFAULT_CAPABILITIES: [u32; 7] = [
-        kvm_bindings::KVM_CAP_IOEVENTFD,
-        kvm_bindings::KVM_CAP_IRQFD,
-        kvm_bindings::KVM_CAP_USER_MEMORY,
-        kvm_bindings::KVM_CAP_ARM_PSCI_0_2,
-        kvm_bindings::KVM_CAP_DEVICE_CTRL,
-        kvm_bindings::KVM_CAP_MP_STATE,
-        kvm_bindings::KVM_CAP_ONE_REG,
-    ];
-
-    /// Creates the GIC (Global Interrupt Controller).
-    pub fn setup_irqchip(&mut self, vcpu_count: u8) -> Result<(), VmError> {
-        self.irqchip_handle = Some(
-            crate::arch::aarch64::gic::create_gic(&self.fd, vcpu_count.into(), None)
-                .map_err(VmError::VmCreateGIC)?,
-        );
-        Ok(())
-    }
-
-    /// Gets a reference to the irqchip of the VM.
-    pub fn get_irqchip(&self) -> &GICDevice {
-        self.irqchip_handle.as_ref().expect("IRQ chip not set")
-    }
-
-    /// Saves and returns the Kvm Vm state.
-    pub fn save_state(&self, mpidrs: &[u64]) -> Result<VmState, VmError> {
-        Ok(VmState {
-            gic: self
-                .get_irqchip()
-                .save_device(mpidrs)
-                .map_err(VmError::SaveGic)?,
-            kvm_cap_modifiers: self.kvm_cap_modifiers.clone(),
-        })
+    /// Returns the memory mappings for the guest memory.
+    pub fn guest_memory_mappings(
+        guest_memory: &GuestMemoryMmap,
+        vm_info: &VmInfo,
+    ) -> Vec<GuestMemoryRegionMapping> {
+        let mut offset = 0;
+        let mut mappings = Vec::new();
+        for mem_region in guest_memory.iter() {
+            mappings.push(GuestMemoryRegionMapping {
+                base_host_virt_addr: mem_region.as_ptr() as u64,
+                size: mem_region.size(),
+                offset,
+                page_size: vm_info.huge_pages.page_size_kib(),
+            });
+            offset += mem_region.size() as u64;
+        }
+        mappings
     }
 
     /// Gets the memory info (resident and empty pages) for all memory regions.
     /// Returns two bitmaps: resident (all resident pages) and empty (zero pages, subset of resident).
     /// This checks at the pageSize of each region and requires all regions to have the same page size.
-    pub fn get_memory_info(&self, vm_info: &VmInfo) -> Result<(Vec<u64>, Vec<u64>), VmError> {
-        let mappings = self.guest_memory_mappings(vm_info);
+    pub fn get_memory_info(
+        &self,
+        guest_memory: &GuestMemoryMmap,
+        vm_info: &VmInfo,
+    ) -> Result<(Vec<u64>, Vec<u64>), VmError> {
+        let mappings = Self::guest_memory_mappings(guest_memory, vm_info);
 
         if mappings.is_empty() {
             return Ok((Vec::new(), Vec::new()));
@@ -338,8 +323,7 @@ impl Vm {
 
             for mapping in &mappings {
                 // Find the memory region that matches this mapping
-                let mem_region = self
-                    .guest_memory()
+                let mem_region = guest_memory
                     .iter()
                     .find(|region| region.as_ptr() as u64 == mapping.base_host_virt_addr)
                     .expect("Memory region not found for mapping");
@@ -410,21 +394,60 @@ impl Vm {
 
         Ok((resident_bitmap, empty_bitmap))
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Vm {
+    const DEFAULT_CAPABILITIES: [u32; 7] = [
+        kvm_bindings::KVM_CAP_IOEVENTFD,
+        kvm_bindings::KVM_CAP_IRQFD,
+        kvm_bindings::KVM_CAP_USER_MEMORY,
+        kvm_bindings::KVM_CAP_ARM_PSCI_0_2,
+        kvm_bindings::KVM_CAP_DEVICE_CTRL,
+        kvm_bindings::KVM_CAP_MP_STATE,
+        kvm_bindings::KVM_CAP_ONE_REG,
+    ];
+
+    /// Creates the GIC (Global Interrupt Controller).
+    pub fn setup_irqchip(&mut self, vcpu_count: u8) -> Result<(), VmError> {
+        self.irqchip_handle = Some(
+            crate::arch::aarch64::gic::create_gic(&self.fd, vcpu_count.into(), None)
+                .map_err(VmError::VmCreateGIC)?,
+        );
+        Ok(())
+    }
+
+    /// Gets a reference to the irqchip of the VM.
+    pub fn get_irqchip(&self) -> &GICDevice {
+        self.irqchip_handle.as_ref().expect("IRQ chip not set")
+    }
+
+    /// Saves and returns the Kvm Vm state.
+    pub fn save_state(&self, mpidrs: &[u64]) -> Result<VmState, VmError> {
+        Ok(VmState {
+            gic: self
+                .get_irqchip()
+                .save_device(mpidrs)
+                .map_err(VmError::SaveGic)?,
+            kvm_cap_modifiers: self.kvm_cap_modifiers.clone(),
+        })
+    }
 
     /// Resets the KVM dirty bitmap for each of the guest's memory regions.
-    pub fn reset_dirty_bitmap(&self) {
-        self.guest_memory()
-            .iter()
-            .zip(0u32..)
-            .for_each(|(region, slot)| {
-                let _ = self.fd().get_dirty_log(slot, u64_to_usize(region.len()));
-            });
+    pub fn reset_dirty_bitmap(&self, guest_memory: &GuestMemoryMmap) {
+        guest_memory.iter().zip(0u32..).for_each(|(region, slot)| {
+            let _ = self.fd().get_dirty_log(slot, u64_to_usize(region.len()));
+        });
     }
 
     /// Retrieves the KVM dirty bitmap for each of the guest's memory regions.
-    pub fn get_dirty_bitmap(&self) -> Result<DirtyBitmap, vmm_sys_util::errno::Error> {
-        let mut bitmap: DirtyBitmap = HashMap::new();
-        self.guest_memory()
+    pub fn get_dirty_bitmap(
+        &self,
+        guest_memory: &GuestMemoryMmap,
+    ) -> Result<crate::DirtyBitmap, vmm_sys_util::errno::Error> {
+        use std::collections::HashMap;
+        let mut bitmap: crate::DirtyBitmap = HashMap::new();
+        guest_memory
             .iter()
             .zip(0u32..)
             .try_for_each(|(region, slot)| {
