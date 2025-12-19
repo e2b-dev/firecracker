@@ -9,7 +9,13 @@ env:
 jobs:
   tests:
     name: Tests
-    runs-on: ubuntu-latest
+    # Increase machine size by requesting a larger GitHub-hosted runner
+    # Options: ubuntu-latest, ubuntu-22.04, ubuntu-20.04, or larger runners below
+    # For more vCPUs and RAM, use ubuntu-latest with 'large' runner
+    # GitHub hosted runners docs: https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources
+    # 'ubuntu-latest' = 2 vCPU, 7 GB RAM; 'ubuntu-latest-8-cores' = 8 vCPU, 32 GB RAM
+    runs-on: ubuntu-latest-8-cores
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -17,8 +23,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Enable hugepages
+        run: |
+          sudo mkdir -p /mnt/hugepages
+          sudo mount -t hugetlbfs none /mnt/hugepages
+          echo 1024 | sudo tee /proc/sys/vm/nr_hugepages
+
       - name: Run tests with devtool
         env:
-          PYTEST_ADDOPTS: "-n 2"
+          PYTEST_ADDOPTS: "-n 4"
         run: |
           ./tools/devtool -y test -- integration_tests/functional/ -k "not vmlinux-5.10"
