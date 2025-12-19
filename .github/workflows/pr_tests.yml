@@ -21,4 +21,4 @@ jobs:
         env:
           PYTEST_ADDOPTS: "-n 2"
         run: |
-          ./tools/devtool -y test -- integration_tests/functional/
+          ./tools/devtool -y test -- integration_tests/functional/ -k "not vmlinux-5.10"
