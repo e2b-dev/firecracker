@@ -8,13 +8,7 @@ env:
 
 jobs:
   tests:
-    name: Tests
-    # Increase machine size by requesting a larger GitHub-hosted runner
-    # Options: ubuntu-latest, ubuntu-22.04, ubuntu-20.04, or larger runners below
-    # For more vCPUs and RAM, use ubuntu-latest with 'large' runner
-    # GitHub hosted runners docs: https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources
-    # 'ubuntu-latest' = 2 vCPU, 7 GB RAM; 'ubuntu-latest-8-cores' = 8 vCPU, 32 GB RAM
-    runs-on: ubuntu-latest-8-cores
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
