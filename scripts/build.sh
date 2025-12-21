@@ -6,7 +6,7 @@ set -euo pipefail
 # Extract full version from src/firecracker/swagger/firecracker.yaml
 FC_VERSION=$(awk '/^info:/{flag=1} flag && /^  version:/{print $2; exit}' src/firecracker/swagger/firecracker.yaml)
 commit_hash=$(git rev-parse --short=7 HEAD)
-version_name="v${FC_VERSION}_g${commit_hash}"
+version_name="v${FC_VERSION}_${commit_hash}"
 echo "Version name: $version_name"
 
 echo "Starting to build Firecracker version: $version_name"
