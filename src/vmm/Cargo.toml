@@ -86,8 +86,3 @@ harness = false
 
 [lints]
 workspace = true
-
-[patch.crates-io]
-aws-lc-sys = "=0.29.0"
-aws-lc-rs = "=1.13.1"
-aws-lc-fips-sys = "=0.13.7"
