@@ -21,6 +21,7 @@ use super::request::logger::parse_put_logger;
 use super::request::machine_configuration::{
     parse_get_machine_config, parse_patch_machine_config, parse_put_machine_config,
 };
+use super::request::memory::{parse_get_memory, parse_get_memory_mappings};
 use super::request::metrics::parse_put_metrics;
 use super::request::mmds::{parse_get_mmds, parse_patch_mmds, parse_put_mmds};
 use super::request::net::{parse_patch_net, parse_put_net};
@@ -82,6 +83,14 @@ impl TryFrom<&Request> for ParsedRequest {
                 Ok(ParsedRequest::new_sync(VmmAction::GetFullVmConfig))
             }
             (Method::Get, "machine-config", None) => parse_get_machine_config(),
+            (Method::Get, "memory", None) => match path_tokens.next() {
+                Some("mappings") => parse_get_memory_mappings(),
+                None => parse_get_memory(),
+                _ => Err(RequestError::InvalidPathMethod(
+                    request_uri.to_string(),
+                    Method::Get,
+                )),
+            },
             (Method::Get, "mmds", None) => parse_get_mmds(),
             (Method::Get, _, Some(_)) => method_to_error(Method::Get),
             (Method::Put, "actions", Some(body)) => parse_put_actions(body),
@@ -172,6 +181,8 @@ impl ParsedRequest {
                 }
                 VmmData::BalloonStats(stats) => Self::success_response_with_data(stats),
                 VmmData::InstanceInformation(info) => Self::success_response_with_data(info),
+                VmmData::MemoryMappings(mappings) => Self::success_response_with_data(mappings),
+                VmmData::Memory(memory) => Self::success_response_with_data(memory),
                 VmmData::VmmVersion(version) => Self::success_response_with_data(
                     &serde_json::json!({ "firecracker_version": version.as_str() }),
                 ),
@@ -568,6 +579,12 @@ pub mod tests {
                 VmmData::InstanceInformation(info) => {
                     http_response(&serde_json::to_string(info).unwrap(), 200)
                 }
+                VmmData::MemoryMappings(mappings) => {
+                    http_response(&serde_json::to_string(mappings).unwrap(), 200)
+                }
+                VmmData::Memory(memory) => {
+                    http_response(&serde_json::to_string(memory).unwrap(), 200)
+                }
                 VmmData::VmmVersion(version) => http_response(
                     &serde_json::json!({ "firecracker_version": version.as_str() }).to_string(),
                     200,
@@ -589,6 +606,15 @@ pub mod tests {
         verify_ok_response_with(VmmData::MachineConfiguration(MachineConfig::default()));
         verify_ok_response_with(VmmData::MmdsValue(serde_json::from_str("{}").unwrap()));
         verify_ok_response_with(VmmData::InstanceInformation(InstanceInfo::default()));
+        verify_ok_response_with(VmmData::MemoryMappings(
+            vmm::vmm_config::instance_info::MemoryMappingsResponse { mappings: vec![] },
+        ));
+        verify_ok_response_with(VmmData::Memory(
+            vmm::vmm_config::instance_info::MemoryResponse {
+                resident: vec![],
+                empty: vec![],
+            },
+        ));
         verify_ok_response_with(VmmData::VmmVersion(String::default()));
 
         // Error.
@@ -656,6 +682,30 @@ pub mod tests {
         let mut connection = HttpConnection::new(receiver);
         sender
             .write_all(http_request("GET", "/mmds", None).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        ParsedRequest::try_from(&req).unwrap();
+    }
+
+    #[test]
+    fn test_try_from_get_memory_mappings() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        sender
+            .write_all(http_request("GET", "/memory/mappings", None).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        ParsedRequest::try_from(&req).unwrap();
+    }
+
+    #[test]
+    fn test_try_from_get_memory() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        sender
+            .write_all(http_request("GET", "/memory", None).as_bytes())
             .unwrap();
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();
