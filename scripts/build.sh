@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-# The format will be: v<major>.<minor>.<patch>_g<commit_hash> — e.g. v1.7.2_g8bb88311
+# The format will be: v<major>.<minor>.<patch>_<commit_hash> — e.g. v1.7.2_8bb88311
 # Extract full version from src/firecracker/swagger/firecracker.yaml
 FC_VERSION=$(awk '/^info:/{flag=1} flag && /^  version:/{print $2; exit}' src/firecracker/swagger/firecracker.yaml)
 commit_hash=$(git rev-parse --short=7 HEAD)
