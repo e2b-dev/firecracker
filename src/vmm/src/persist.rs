@@ -171,7 +171,10 @@ pub fn create_snapshot(
 
     snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
 
-    snapshot_memory_to_file(vmm, &params.mem_file_path, params.snapshot_type)?;
+    // Dump memory to file only if mem_file_path is specified
+    if let Some(ref mem_file_path) = params.mem_file_path {
+        snapshot_memory_to_file(vmm, mem_file_path, params.snapshot_type)?;
+    }
 
     Ok(())
 }
