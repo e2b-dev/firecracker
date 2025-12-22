@@ -9,4 +9,4 @@ upload:
 	./scripts/upload.sh $(GCP_PROJECT_ID)
 
 .PHONY: build-and-upload
-make build-and-upload: build upload
+build-and-upload: build upload

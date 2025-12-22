@@ -321,6 +321,8 @@ impl Vm {
             // This is the most important optimization - avoids repeated allocations
             let zero_buf = vec![0u8; page_size];
 
+            let sys_page_size = host_page_size();
+
             for mapping in &mappings {
                 // Find the memory region that matches this mapping
                 let mem_region = guest_memory
@@ -333,7 +335,6 @@ impl Vm {
                 let num_pages = region_size / page_size;
 
                 // Use mincore on the entire region to check residency
-                let sys_page_size = host_page_size();
                 let mincore_pages = region_size.div_ceil(sys_page_size);
                 let mut mincore_vec = vec![0u8; mincore_pages];
 
