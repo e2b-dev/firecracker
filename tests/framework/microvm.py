@@ -328,14 +328,14 @@ class Microvm:
             # reason is the wrong PID, e.g. this is a regression test for
             # https://github.com/firecracker-microvm/firecracker/pull/4442/commits/d63eb7a65ffaaae0409d15ed55d99ecbd29bc572
 
-            # filter ps results for the jailer's unique id
-            _, stdout, stderr = utils.check_output(
-                f"ps aux | grep {self.jailer.jailer_id}"
+            # filter ps results for the jailer's unique id (grep returns 1 when no match)
+            result = utils.run_cmd(
+                f"ps aux | grep {self.jailer.jailer_id}", check=False
             )
             # make sure firecracker was killed
             assert (
-                stderr == "" and "firecracker" not in stdout
-            ), f"Firecracker reported its pid {self.firecracker_pid}, which was killed, but there still exist processes using the supposedly dead Firecracker's jailer_id: {stdout}"
+                result.stderr == "" and "firecracker" not in result.stdout
+            ), f"Firecracker reported its pid {self.firecracker_pid}, which was killed, but there still exist processes using the supposedly dead Firecracker's jailer_id: {result.stdout}"
 
         # Mark the microVM as not spawned, so we avoid trying to kill twice.
         self._spawned = False
