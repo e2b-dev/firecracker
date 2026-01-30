@@ -3,7 +3,8 @@
 """Benchmark: memory workload time after pause/resume or UFFD restore.
 
 Uses dd to /dev/shm (1 GiB) so no apt/network; after UFFD restore this triggers
-page faults. Scenarios: normal no UFFD (pause/resume), normal UFFD, hugepages UFFD.
+page faults. Scenarios: normal no UFFD (pause/resume), normal no UFFD + dirty
+tracking, normal UFFD, hugepages UFFD.
 """
 
 import time
@@ -29,22 +30,33 @@ def _run_workload(microvm, name):
 @pytest.mark.parametrize(
     "scenario",
     [
-        ("normal_no_uffd", HugePagesConfig.NONE, False),
-        ("normal_uffd", HugePagesConfig.NONE, True),
-        ("hugepages_uffd", HugePagesConfig.HUGETLBFS_2MB, True),
+        ("normal_no_uffd", HugePagesConfig.NONE, False, False),
+        ("normal_no_uffd_dirty_tracking", HugePagesConfig.NONE, False, True),
+        ("normal_uffd", HugePagesConfig.NONE, True, False),
+        ("hugepages_uffd", HugePagesConfig.HUGETLBFS_2MB, True, False),
     ],
-    ids=["normal_pages_no_uffd", "normal_pages_uffd", "hugepages_uffd"],
+    ids=[
+        "normal_pages_no_uffd",
+        "normal_pages_no_uffd_dirty_tracking",
+        "normal_pages_uffd",
+        "hugepages_uffd",
+    ],
 )
 def test_sysbench_after_pause_resume_or_uffd_restore(
     microvm_factory, guest_kernel_linux_6_1, rootfs, scenario
 ):
     """Run 1 GiB memory workload after pause/resume or UFFD restore; report duration."""
-    scenario_name, huge_pages, use_uffd = scenario
+    scenario_name, huge_pages, use_uffd, track_dirty_pages = scenario
 
     vm = microvm_factory.build(guest_kernel_linux_6_1, rootfs)
     vm.memory_monitor = None
     vm.spawn()
-    vm.basic_config(vcpu_count=2, mem_size_mib=MEM_SIZE_MIB, huge_pages=huge_pages)
+    vm.basic_config(
+        vcpu_count=2,
+        mem_size_mib=MEM_SIZE_MIB,
+        huge_pages=huge_pages,
+        track_dirty_pages=track_dirty_pages,
+    )
     vm.add_net_iface()
     vm.start()
 
