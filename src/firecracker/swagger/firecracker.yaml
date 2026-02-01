@@ -1293,9 +1293,12 @@ definitions:
         enum:
           - Full
           - Diff
+          - Msync
+          - MsyncAndState
         description:
           Type of snapshot to create. It is optional and by default, a full
-          snapshot is created.
+          snapshot is created. Msync only syncs memory to the backing file
+          (for live migration). MsyncAndState syncs memory and saves state.
 
   NetworkOverride:
     type: object
@@ -1351,6 +1354,24 @@ definitions:
         description: Network host device names to override
         items:
           $ref: "#/definitions/NetworkOverride"
+      shared:
+        type: boolean
+        description:
+          When set to true and the guest memory backend is a file, changes to
+          the memory are asynchronously written back to the backend as the VM
+          is running (using MAP_SHARED instead of MAP_PRIVATE). This is useful
+          for live migration scenarios.
+      thp:
+        type: boolean
+        description:
+          When set to true, hint the kernel to use transparent hugepages (THP)
+          for guest memory via madvise(MADV_HUGEPAGE). This can improve
+          performance for memory-intensive workloads.
+      direct_io:
+        type: boolean
+        description:
+          When set to true, open the memory backend with O_DIRECT to bypass
+          the host page cache. Useful for block device backends like ublk.
 
 
   TokenBucket:

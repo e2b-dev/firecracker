@@ -41,6 +41,19 @@ pub struct BalloonStatsState {
     disk_caches: Option<u64>,
     hugetlb_allocations: Option<u64>,
     hugetlb_failures: Option<u64>,
+    // Linux 6.12+ stats - use default for backward compatibility
+    #[serde(default)]
+    oom_kill: Option<u64>,
+    #[serde(default)]
+    alloc_stall: Option<u64>,
+    #[serde(default)]
+    async_scan: Option<u64>,
+    #[serde(default)]
+    direct_scan: Option<u64>,
+    #[serde(default)]
+    async_reclaim: Option<u64>,
+    #[serde(default)]
+    direct_reclaim: Option<u64>,
 }
 
 impl BalloonStatsState {
@@ -56,6 +69,12 @@ impl BalloonStatsState {
             disk_caches: stats.disk_caches,
             hugetlb_allocations: stats.hugetlb_allocations,
             hugetlb_failures: stats.hugetlb_failures,
+            oom_kill: stats.oom_kill,
+            alloc_stall: stats.alloc_stall,
+            async_scan: stats.async_scan,
+            direct_scan: stats.direct_scan,
+            async_reclaim: stats.async_reclaim,
+            direct_reclaim: stats.direct_reclaim,
         }
     }
 
@@ -75,6 +94,12 @@ impl BalloonStatsState {
             disk_caches: self.disk_caches,
             hugetlb_allocations: self.hugetlb_allocations,
             hugetlb_failures: self.hugetlb_failures,
+            oom_kill: self.oom_kill,
+            alloc_stall: self.alloc_stall,
+            async_scan: self.async_scan,
+            direct_scan: self.direct_scan,
+            async_reclaim: self.async_reclaim,
+            direct_reclaim: self.direct_reclaim,
         }
     }
 }
@@ -96,6 +121,10 @@ pub struct BalloonConstructorArgs {
     /// Pointer to guest memory.
     pub mem: GuestMemoryMmap,
     pub restored_from_file: bool,
+    /// Whether guest memory is backed by shared file (MAP_SHARED).
+    pub shared_memory: bool,
+    /// Whether transparent hugepages are enabled.
+    pub thp_enabled: bool,
 }
 
 impl Persist<'_> for Balloon {
@@ -127,6 +156,8 @@ impl Persist<'_> for Balloon {
             false,
             state.stats_polling_interval_s,
             constructor_args.restored_from_file,
+            constructor_args.shared_memory,
+            constructor_args.thp_enabled,
         )?;
 
         let mut num_queues = BALLOON_NUM_QUEUES;
@@ -192,7 +223,7 @@ mod tests {
         let mut mem = vec![0; 4096];
 
         // Create and save the balloon device.
-        let balloon = Balloon::new(0x42, false, 2, false).unwrap();
+        let balloon = Balloon::new(0x42, false, 2, false, false, false).unwrap();
 
         Snapshot::serialize(&mut mem.as_mut_slice(), &balloon.save()).unwrap();
 
@@ -201,6 +232,8 @@ mod tests {
             BalloonConstructorArgs {
                 mem: guest_mem,
                 restored_from_file: true,
+                shared_memory: false,
+                thp_enabled: false,
             },
             &Snapshot::deserialize(&mut mem.as_slice()).unwrap(),
         )

@@ -4,7 +4,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use log::error;
+use log::{debug, error};
 use serde::Serialize;
 use timerfd::{ClockId, SetTimeFlags, TimerFd, TimerState};
 use vmm_sys_util::eventfd::EventFd;
@@ -16,12 +16,14 @@ use super::metrics::METRICS;
 use super::util::{compact_page_frame_numbers, remove_range};
 use super::{
     BALLOON_DEV_ID, BALLOON_NUM_QUEUES, BALLOON_QUEUE_SIZES, DEFLATE_INDEX, INFLATE_INDEX,
-    MAX_PAGE_COMPACT_BUFFER, MAX_PAGES_IN_DESC, MIB_TO_4K_PAGES, STATS_INDEX,
-    VIRTIO_BALLOON_F_DEFLATE_ON_OOM, VIRTIO_BALLOON_F_STATS_VQ, VIRTIO_BALLOON_PFN_SHIFT,
-    VIRTIO_BALLOON_S_AVAIL, VIRTIO_BALLOON_S_CACHES, VIRTIO_BALLOON_S_HTLB_PGALLOC,
+    MAX_PAGE_COMPACT_BUFFER, MAX_PAGES_IN_DESC, MIB_TO_4K_PAGES, REPORTING_INDEX, STATS_INDEX,
+    VIRTIO_BALLOON_F_DEFLATE_ON_OOM, VIRTIO_BALLOON_F_PAGE_REPORTING, VIRTIO_BALLOON_F_STATS_VQ,
+    VIRTIO_BALLOON_PFN_SHIFT, VIRTIO_BALLOON_S_ALLOC_STALL, VIRTIO_BALLOON_S_ASYNC_RECLAIM,
+    VIRTIO_BALLOON_S_ASYNC_SCAN, VIRTIO_BALLOON_S_AVAIL, VIRTIO_BALLOON_S_CACHES,
+    VIRTIO_BALLOON_S_DIRECT_RECLAIM, VIRTIO_BALLOON_S_DIRECT_SCAN, VIRTIO_BALLOON_S_HTLB_PGALLOC,
     VIRTIO_BALLOON_S_HTLB_PGFAIL, VIRTIO_BALLOON_S_MAJFLT, VIRTIO_BALLOON_S_MEMFREE,
-    VIRTIO_BALLOON_S_MEMTOT, VIRTIO_BALLOON_S_MINFLT, VIRTIO_BALLOON_S_SWAP_IN,
-    VIRTIO_BALLOON_S_SWAP_OUT,
+    VIRTIO_BALLOON_S_MEMTOT, VIRTIO_BALLOON_S_MINFLT, VIRTIO_BALLOON_S_OOM_KILL,
+    VIRTIO_BALLOON_S_SWAP_IN, VIRTIO_BALLOON_S_SWAP_OUT,
 };
 use crate::devices::virtio::balloon::BalloonError;
 use crate::devices::virtio::device::{IrqTrigger, IrqType};
@@ -124,10 +126,28 @@ pub struct BalloonStats {
     /// in the guest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hugetlb_failures: Option<u64>,
+    /// OOM killer invocations. Linux 6.12+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oom_kill: Option<u64>,
+    /// Stall count of memory allocation. Linux 6.12+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alloc_stall: Option<u64>,
+    /// Amount of memory scanned asynchronously. Linux 6.12+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub async_scan: Option<u64>,
+    /// Amount of memory scanned directly. Linux 6.12+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direct_scan: Option<u64>,
+    /// Amount of memory reclaimed asynchronously. Linux 6.12+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub async_reclaim: Option<u64>,
+    /// Amount of memory reclaimed directly. Linux 6.12+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direct_reclaim: Option<u64>,
 }
 
 impl BalloonStats {
-    fn update_with_stat(&mut self, stat: &BalloonStat) -> Result<(), BalloonError> {
+    fn update_with_stat(&mut self, stat: &BalloonStat) {
         let val = Some(stat.val);
         match stat.tag {
             VIRTIO_BALLOON_S_SWAP_IN => self.swap_in = val,
@@ -140,12 +160,17 @@ impl BalloonStats {
             VIRTIO_BALLOON_S_CACHES => self.disk_caches = val,
             VIRTIO_BALLOON_S_HTLB_PGALLOC => self.hugetlb_allocations = val,
             VIRTIO_BALLOON_S_HTLB_PGFAIL => self.hugetlb_failures = val,
-            _ => {
-                return Err(BalloonError::MalformedPayload);
+            VIRTIO_BALLOON_S_OOM_KILL => self.oom_kill = val,
+            VIRTIO_BALLOON_S_ALLOC_STALL => self.alloc_stall = val,
+            VIRTIO_BALLOON_S_ASYNC_SCAN => self.async_scan = val,
+            VIRTIO_BALLOON_S_DIRECT_SCAN => self.direct_scan = val,
+            VIRTIO_BALLOON_S_ASYNC_RECLAIM => self.async_reclaim = val,
+            VIRTIO_BALLOON_S_DIRECT_RECLAIM => self.direct_reclaim = val,
+            tag => {
+                METRICS.stats_update_fails.inc();
+                debug!("balloon: unknown stats update tag: {tag}");
             }
         }
-
-        Ok(())
     }
 }
 
@@ -165,6 +190,12 @@ pub struct Balloon {
 
     // Implementation specific fields.
     pub(crate) restored_from_file: bool,
+    /// Whether guest memory is backed by shared file (MAP_SHARED).
+    /// When true, use MADV_REMOVE to punch holes on balloon inflate.
+    pub(crate) shared_memory: bool,
+    /// Whether transparent hugepages (THP) are enabled.
+    /// When true, align balloon operations to 2MB boundaries for better THP utilization.
+    pub(crate) thp_enabled: bool,
     pub(crate) stats_polling_interval_s: u16,
     pub(crate) stats_timer: TimerFd,
     // The index of the previous stats descriptor is saved because
@@ -190,6 +221,8 @@ impl fmt::Debug for Balloon {
             .field("device_state", &self.device_state)
             .field("irq_trigger", &self.irq_trigger)
             .field("restored_from_file", &self.restored_from_file)
+            .field("shared_memory", &self.shared_memory)
+            .field("thp_enabled", &self.thp_enabled)
             .field("stats_polling_interval_s", &self.stats_polling_interval_s)
             .field("stats_desc_index", &self.stats_desc_index)
             .field("latest_stats", &self.latest_stats)
@@ -205,6 +238,8 @@ impl Balloon {
         deflate_on_oom: bool,
         stats_polling_interval_s: u16,
         restored_from_file: bool,
+        shared_memory: bool,
+        thp_enabled: bool,
     ) -> Result<Balloon, BalloonError> {
         let mut avail_features = 1u64 << VIRTIO_F_VERSION_1;
 
@@ -216,7 +251,12 @@ impl Balloon {
             avail_features |= 1u64 << VIRTIO_BALLOON_F_STATS_VQ;
         }
 
+        // Enable free page reporting - allows guest to proactively report free pages.
+        // Most useful with shared memory backing for immediate space reclamation.
+        avail_features |= 1u64 << VIRTIO_BALLOON_F_PAGE_REPORTING;
+
         let queue_evts = [
+            EventFd::new(libc::EFD_NONBLOCK).map_err(BalloonError::EventFd)?,
             EventFd::new(libc::EFD_NONBLOCK).map_err(BalloonError::EventFd)?,
             EventFd::new(libc::EFD_NONBLOCK).map_err(BalloonError::EventFd)?,
             EventFd::new(libc::EFD_NONBLOCK).map_err(BalloonError::EventFd)?,
@@ -226,6 +266,7 @@ impl Balloon {
 
         // The VirtIO specification states that the statistics queue should
         // not be present at all if the statistics are not enabled.
+        // Note: We keep the reporting queue (index 3) always available.
         if stats_polling_interval_s == 0 {
             let _ = queues.remove(STATS_INDEX);
         }
@@ -246,6 +287,8 @@ impl Balloon {
             device_state: DeviceState::Inactive,
             activate_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(BalloonError::EventFd)?,
             restored_from_file,
+            shared_memory,
+            thp_enabled,
             stats_polling_interval_s,
             stats_timer,
             stats_desc_index: None,
@@ -273,6 +316,19 @@ impl Balloon {
             .read()
             .map_err(BalloonError::EventFd)?;
         self.process_stats_queue()
+    }
+
+    pub(crate) fn process_reporting_queue_event(&mut self) -> Result<(), BalloonError> {
+        // When stats are disabled, reporting queue shifts from index 3 to 2.
+        let reporting_idx = if self.stats_enabled() {
+            REPORTING_INDEX
+        } else {
+            REPORTING_INDEX - 1
+        };
+        self.queue_evts[reporting_idx]
+            .read()
+            .map_err(BalloonError::EventFd)?;
+        self.process_reporting()
     }
 
     pub(crate) fn process_stats_timer_event(&mut self) -> Result<(), BalloonError> {
@@ -356,6 +412,8 @@ impl Balloon {
                     mem,
                     (guest_addr, u64::from(range_len) << VIRTIO_BALLOON_PFN_SHIFT),
                     self.restored_from_file,
+                    self.shared_memory,
+                    self.thp_enabled,
                 ) {
                     error!("Error removing memory range: {:?}", err);
                 }
@@ -389,6 +447,113 @@ impl Balloon {
         }
     }
 
+    /// Returns true if free page reporting feature was negotiated with guest.
+    pub fn reporting_enabled(&self) -> bool {
+        self.acked_features & (1u64 << VIRTIO_BALLOON_F_PAGE_REPORTING) != 0
+    }
+
+    /// Process free page reporting queue.
+    /// The guest proactively reports free pages that can be discarded.
+    /// Unlike balloon inflate, this is a hint - the guest can reuse these pages anytime.
+    pub(crate) fn process_reporting(&mut self) -> Result<(), BalloonError> {
+        let mem = self.device_state.mem().unwrap();
+        METRICS.free_page_report_count.inc();
+
+        // Reporting queue index depends on whether stats are enabled.
+        let reporting_queue_idx = if self.stats_enabled() {
+            REPORTING_INDEX
+        } else {
+            REPORTING_INDEX - 1
+        };
+
+        let queue = &mut self.queues[reporting_queue_idx];
+        let mut pfn_buffer_idx = 0;
+        let mut needs_interrupt = false;
+        let mut valid_descs_found = true;
+        let mut total_pages_reported: u64 = 0;
+
+        while valid_descs_found {
+            valid_descs_found = false;
+
+            while let Some(head) = queue.pop() {
+                let len = head.len as usize;
+                let max_len = MAX_PAGES_IN_DESC * SIZE_OF_U32;
+                valid_descs_found = true;
+
+                if !head.is_write_only() && len % SIZE_OF_U32 == 0 {
+                    if len > max_len {
+                        error!(
+                            "Reporting descriptor has bogus page count {} > {}, skipping.",
+                            len / SIZE_OF_U32,
+                            MAX_PAGES_IN_DESC
+                        );
+                        continue;
+                    }
+
+                    if MAX_PAGE_COMPACT_BUFFER - pfn_buffer_idx < len / SIZE_OF_U32 {
+                        queue.undo_pop();
+                        break;
+                    }
+
+                    for index in (0..len).step_by(SIZE_OF_U32) {
+                        let addr = head
+                            .addr
+                            .checked_add(index as u64)
+                            .ok_or(BalloonError::MalformedDescriptor)?;
+
+                        let page_frame_number = mem
+                            .read_obj::<u32>(addr)
+                            .map_err(|_| BalloonError::MalformedDescriptor)?;
+
+                        self.pfn_buffer[pfn_buffer_idx] = page_frame_number;
+                        pfn_buffer_idx += 1;
+                    }
+                }
+
+                queue.add_used(head.index, 0).map_err(BalloonError::Queue)?;
+                needs_interrupt = true;
+            }
+
+            let page_ranges = compact_page_frame_numbers(&mut self.pfn_buffer[..pfn_buffer_idx]);
+            pfn_buffer_idx = 0;
+
+            for (page_frame_number, range_len) in page_ranges {
+                let guest_addr =
+                    GuestAddress(u64::from(page_frame_number) << VIRTIO_BALLOON_PFN_SHIFT);
+                let range_bytes = u64::from(range_len) << VIRTIO_BALLOON_PFN_SHIFT;
+                total_pages_reported += u64::from(range_len);
+
+                if let Err(err) = remove_range(
+                    mem,
+                    (guest_addr, range_bytes),
+                    self.restored_from_file,
+                    self.shared_memory,
+                    self.thp_enabled,
+                ) {
+                    METRICS.free_page_report_fails.inc();
+                    error!("Error discarding reported free pages: {:?}", err);
+                } else {
+                    METRICS.free_page_report_freed.add(range_bytes);
+                }
+            }
+        }
+        queue.advance_used_ring_idx();
+
+        if total_pages_reported > 0 {
+            debug!(
+                "Free page reporting: discarded {} pages ({} MiB)",
+                total_pages_reported,
+                total_pages_reported / 256
+            );
+        }
+
+        if needs_interrupt {
+            self.signal_used_queue()?;
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn process_stats_queue(&mut self) -> Result<(), BalloonError> {
         // This is safe since we checked in the event handler that the device is activated.
         let mem = self.device_state.mem().unwrap();
@@ -415,10 +580,7 @@ impl Balloon {
                 let stat = mem
                     .read_obj::<BalloonStat>(addr)
                     .map_err(|_| BalloonError::MalformedDescriptor)?;
-                self.latest_stats.update_with_stat(&stat).map_err(|_| {
-                    METRICS.stats_update_fails.inc();
-                    BalloonError::MalformedPayload
-                })?;
+                self.latest_stats.update_with_stat(&stat);
             }
 
             self.stats_desc_index = Some(head.index);
@@ -684,6 +846,12 @@ pub(crate) mod tests {
             disk_caches: Some(0),
             hugetlb_allocations: Some(0),
             hugetlb_failures: Some(0),
+            oom_kill: Some(0),
+            alloc_stall: Some(0),
+            async_scan: Some(0),
+            direct_scan: Some(0),
+            async_reclaim: Some(0),
+            direct_reclaim: Some(0),
         };
 
         let mut stat = BalloonStat {
@@ -691,35 +859,42 @@ pub(crate) mod tests {
             val: 1,
         };
 
-        stats.update_with_stat(&stat).unwrap();
+        stats.update_with_stat(&stat);
         assert_eq!(stats.swap_in, Some(1));
         stat.tag = VIRTIO_BALLOON_S_SWAP_OUT;
-        stats.update_with_stat(&stat).unwrap();
+        stats.update_with_stat(&stat);
         assert_eq!(stats.swap_out, Some(1));
         stat.tag = VIRTIO_BALLOON_S_MAJFLT;
-        stats.update_with_stat(&stat).unwrap();
+        stats.update_with_stat(&stat);
         assert_eq!(stats.major_faults, Some(1));
         stat.tag = VIRTIO_BALLOON_S_MINFLT;
-        stats.update_with_stat(&stat).unwrap();
+        stats.update_with_stat(&stat);
         assert_eq!(stats.minor_faults, Some(1));
         stat.tag = VIRTIO_BALLOON_S_MEMFREE;
-        stats.update_with_stat(&stat).unwrap();
+        stats.update_with_stat(&stat);
         assert_eq!(stats.free_memory, Some(1));
         stat.tag = VIRTIO_BALLOON_S_MEMTOT;
-        stats.update_with_stat(&stat).unwrap();
+        stats.update_with_stat(&stat);
         assert_eq!(stats.total_memory, Some(1));
         stat.tag = VIRTIO_BALLOON_S_AVAIL;
-        stats.update_with_stat(&stat).unwrap();
+        stats.update_with_stat(&stat);
         assert_eq!(stats.available_memory, Some(1));
         stat.tag = VIRTIO_BALLOON_S_CACHES;
-        stats.update_with_stat(&stat).unwrap();
+        stats.update_with_stat(&stat);
         assert_eq!(stats.disk_caches, Some(1));
         stat.tag = VIRTIO_BALLOON_S_HTLB_PGALLOC;
-        stats.update_with_stat(&stat).unwrap();
+        stats.update_with_stat(&stat);
         assert_eq!(stats.hugetlb_allocations, Some(1));
         stat.tag = VIRTIO_BALLOON_S_HTLB_PGFAIL;
-        stats.update_with_stat(&stat).unwrap();
+        stats.update_with_stat(&stat);
         assert_eq!(stats.hugetlb_failures, Some(1));
+        // Test new Linux 6.12+ stats
+        stat.tag = VIRTIO_BALLOON_S_OOM_KILL;
+        stats.update_with_stat(&stat);
+        assert_eq!(stats.oom_kill, Some(1));
+        stat.tag = VIRTIO_BALLOON_S_ALLOC_STALL;
+        stats.update_with_stat(&stat);
+        assert_eq!(stats.alloc_stall, Some(1));
     }
 
     #[test]
@@ -727,12 +902,13 @@ pub(crate) mod tests {
         // Test all feature combinations.
         for deflate_on_oom in [true, false].iter() {
             for stats_interval in [0, 1].iter() {
-                let mut balloon = Balloon::new(0, *deflate_on_oom, *stats_interval, false).unwrap();
+                let mut balloon = Balloon::new(0, *deflate_on_oom, *stats_interval, false, false, false).unwrap();
                 assert_eq!(balloon.device_type(), TYPE_BALLOON);
 
                 let features: u64 = (1u64 << VIRTIO_F_VERSION_1)
                     | (u64::from(*deflate_on_oom) << VIRTIO_BALLOON_F_DEFLATE_ON_OOM)
-                    | ((u64::from(*stats_interval)) << VIRTIO_BALLOON_F_STATS_VQ);
+                    | ((u64::from(*stats_interval)) << VIRTIO_BALLOON_F_STATS_VQ)
+                    | (1u64 << VIRTIO_BALLOON_F_PAGE_REPORTING);
 
                 assert_eq!(
                     balloon.avail_features_by_page(0),
@@ -754,7 +930,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_virtio_read_config() {
-        let balloon = Balloon::new(0x10, true, 0, false).unwrap();
+        let balloon = Balloon::new(0x10, true, 0, false, false, false).unwrap();
 
         let cfg = BalloonConfig {
             amount_mib: 16,
@@ -788,7 +964,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_virtio_write_config() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false, false).unwrap();
 
         let expected_config_space: [u8; BALLOON_CONFIG_SPACE_SIZE] =
             [0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -814,7 +990,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_invalid_request() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false, false).unwrap();
         let mem = default_mem();
         // Only initialize the inflate queue to demonstrate invalid request handling.
         let infq = VirtQueue::new(GuestAddress(0), &mem, 16);
@@ -873,7 +1049,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_inflate() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false, false).unwrap();
         let mem = default_mem();
         let infq = VirtQueue::new(GuestAddress(0), &mem, 16);
         balloon.set_queue(INFLATE_INDEX, infq.create_queue());
@@ -943,7 +1119,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_deflate() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false, false).unwrap();
         let mem = default_mem();
         let defq = VirtQueue::new(GuestAddress(0), &mem, 16);
         balloon.set_queue(DEFLATE_INDEX, defq.create_queue());
@@ -991,7 +1167,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_stats() {
-        let mut balloon = Balloon::new(0, true, 1, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 1, false, false, false).unwrap();
         let mem = default_mem();
         let statsq = VirtQueue::new(GuestAddress(0), &mem, 16);
         balloon.set_queue(STATS_INDEX, statsq.create_queue());
@@ -1078,7 +1254,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_process_balloon_queues() {
-        let mut balloon = Balloon::new(0x10, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0x10, true, 0, false, false, false).unwrap();
         let mem = default_mem();
         let infq = VirtQueue::new(GuestAddress(0), &mem, 16);
         let defq = VirtQueue::new(GuestAddress(0), &mem, 16);
@@ -1092,7 +1268,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_update_stats_interval() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false, false).unwrap();
         let mem = default_mem();
         balloon.activate(mem).unwrap();
         assert_eq!(
@@ -1101,7 +1277,7 @@ pub(crate) mod tests {
         );
         balloon.update_stats_polling_interval(0).unwrap();
 
-        let mut balloon = Balloon::new(0, true, 1, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 1, false, false, false).unwrap();
         let mem = default_mem();
         balloon.activate(mem).unwrap();
         assert_eq!(
@@ -1114,14 +1290,14 @@ pub(crate) mod tests {
 
     #[test]
     fn test_cannot_update_inactive_device() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false, false).unwrap();
         // Assert that we can't update an inactive device.
         balloon.update_size(1).unwrap_err();
     }
 
     #[test]
     fn test_num_pages() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false, false).unwrap();
         // Switch the state to active.
         balloon.device_state = DeviceState::Activated(single_region_mem(0x1));
 

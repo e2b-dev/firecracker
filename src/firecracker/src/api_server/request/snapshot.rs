@@ -106,6 +106,9 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         enable_diff_snapshots: snapshot_config.enable_diff_snapshots,
         resume_vm: snapshot_config.resume_vm,
         network_overrides: snapshot_config.network_overrides,
+        shared: snapshot_config.shared,
+        thp: snapshot_config.thp,
+        direct_io: snapshot_config.direct_io,
     };
 
     // Construct the `ParsedRequest` object.
@@ -183,6 +186,9 @@ mod tests {
             enable_diff_snapshots: false,
             resume_vm: false,
             network_overrides: vec![],
+            shared: false,
+            thp: false,
+            direct_io: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -213,6 +219,9 @@ mod tests {
             enable_diff_snapshots: true,
             resume_vm: false,
             network_overrides: vec![],
+            shared: false,
+            thp: false,
+            direct_io: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -243,6 +252,9 @@ mod tests {
             enable_diff_snapshots: false,
             resume_vm: true,
             network_overrides: vec![],
+            shared: false,
+            thp: false,
+            direct_io: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -282,6 +294,9 @@ mod tests {
                 iface_id: String::from("eth0"),
                 host_dev_name: String::from("vmtap2"),
             }],
+            shared: false,
+            thp: false,
+            direct_io: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -309,6 +324,9 @@ mod tests {
             enable_diff_snapshots: false,
             resume_vm: true,
             network_overrides: vec![],
+            shared: false,
+            thp: false,
+            direct_io: false,
         };
         let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert_eq!(

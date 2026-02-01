@@ -24,11 +24,11 @@ use crate::logger::IncMetric;
 pub const BALLOON_DEV_ID: &str = "balloon";
 /// The size of the config space.
 pub const BALLOON_CONFIG_SPACE_SIZE: usize = 8;
-/// Number of virtio queues.
-pub const BALLOON_NUM_QUEUES: usize = 3;
+/// Number of virtio queues (inflate, deflate, stats, reporting).
+pub const BALLOON_NUM_QUEUES: usize = 4;
 /// Virtio queue sizes, in number of descriptor chain heads.
-//  There are 3 queues for a virtio device (in this order): RX, TX, Event
 pub const BALLOON_QUEUE_SIZES: [u16; BALLOON_NUM_QUEUES] = [
+    FIRECRACKER_MAX_QUEUE_SIZE,
     FIRECRACKER_MAX_QUEUE_SIZE,
     FIRECRACKER_MAX_QUEUE_SIZE,
     FIRECRACKER_MAX_QUEUE_SIZE,
@@ -42,18 +42,28 @@ pub const MAX_PAGES_IN_DESC: usize = 256;
 pub const MAX_PAGE_COMPACT_BUFFER: usize = 2048;
 /// The addresses given by the driver are divided by 4096.
 pub const VIRTIO_BALLOON_PFN_SHIFT: u32 = 12;
-/// The index of the deflate queue from Balloon device queues/queues_evts vector.
+/// The index of the inflate queue.
 pub const INFLATE_INDEX: usize = 0;
-/// The index of the deflate queue from Balloon device queues/queues_evts vector.
+/// The index of the deflate queue.
 pub const DEFLATE_INDEX: usize = 1;
-/// The index of the deflate queue from Balloon device queues/queues_evts vector.
+/// The index of the stats queue.
 pub const STATS_INDEX: usize = 2;
+/// The index of the free page reporting queue.
+pub const REPORTING_INDEX: usize = 3;
 
 // The feature bitmap for virtio balloon.
 const VIRTIO_BALLOON_F_STATS_VQ: u32 = 1; // Enable statistics.
 const VIRTIO_BALLOON_F_DEFLATE_ON_OOM: u32 = 2; // Deflate balloon on OOM.
+// Free page reporting - allows guest to report free pages for host discard.
+// Requires Linux 5.5+ guest kernel with CONFIG_PAGE_REPORTING=y.
+const VIRTIO_BALLOON_F_PAGE_REPORTING: u32 = 5;
 
-// The statistics tags.
+/// Size of a transparent huge page (2MB).
+pub const THP_SIZE: usize = 2 * 1024 * 1024;
+/// Number of 4K pages in a THP.
+pub const THP_4K_PAGES: u32 = (THP_SIZE / 4096) as u32;
+
+// The statistics tags (defined in linux "include/uapi/linux/virtio_balloon.h").
 const VIRTIO_BALLOON_S_SWAP_IN: u16 = 0;
 const VIRTIO_BALLOON_S_SWAP_OUT: u16 = 1;
 const VIRTIO_BALLOON_S_MAJFLT: u16 = 2;
@@ -64,6 +74,13 @@ const VIRTIO_BALLOON_S_AVAIL: u16 = 6;
 const VIRTIO_BALLOON_S_CACHES: u16 = 7;
 const VIRTIO_BALLOON_S_HTLB_PGALLOC: u16 = 8;
 const VIRTIO_BALLOON_S_HTLB_PGFAIL: u16 = 9;
+// Linux 6.12+ stats
+const VIRTIO_BALLOON_S_OOM_KILL: u16 = 10;
+const VIRTIO_BALLOON_S_ALLOC_STALL: u16 = 11;
+const VIRTIO_BALLOON_S_ASYNC_SCAN: u16 = 12;
+const VIRTIO_BALLOON_S_DIRECT_SCAN: u16 = 13;
+const VIRTIO_BALLOON_S_ASYNC_RECLAIM: u16 = 14;
+const VIRTIO_BALLOON_S_DIRECT_RECLAIM: u16 = 15;
 
 /// Balloon device related errors.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]

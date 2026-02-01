@@ -215,6 +215,10 @@ pub struct MMIODevManagerConstructorArgs<'a> {
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
     pub restored_from_file: bool,
+    /// Whether guest memory is backed by shared file (MAP_SHARED).
+    pub shared_memory: bool,
+    /// Whether transparent hugepages are enabled.
+    pub thp_enabled: bool,
 }
 impl fmt::Debug for MMIODevManagerConstructorArgs<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -516,6 +520,8 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 BalloonConstructorArgs {
                     mem: mem.clone(),
                     restored_from_file: constructor_args.restored_from_file,
+                    shared_memory: constructor_args.shared_memory,
+                    thp_enabled: constructor_args.thp_enabled,
                 },
                 &balloon_state.device_state,
             )?));
@@ -812,6 +818,8 @@ mod tests {
             vm_resources,
             instance_id: "microvm-id",
             restored_from_file: true,
+            shared_memory: false,
+            thp_enabled: false,
         };
         let restored_dev_manager =
             MMIODeviceManager::restore(restore_args, &device_states).unwrap();

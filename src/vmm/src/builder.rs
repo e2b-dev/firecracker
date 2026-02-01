@@ -418,6 +418,8 @@ pub fn build_microvm_from_snapshot(
     uffd: Option<Uffd>,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
+    shared_memory: bool,
+    thp_enabled: bool,
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
@@ -480,6 +482,8 @@ pub fn build_microvm_from_snapshot(
         vm_resources,
         instance_id: &instance_info.id,
         restored_from_file: vmm.uffd.is_none(),
+        shared_memory,
+        thp_enabled,
     };
 
     vmm.mmio_device_manager =

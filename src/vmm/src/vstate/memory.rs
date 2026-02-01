@@ -122,14 +122,51 @@ pub fn anonymous(
     )
 }
 
-/// Creates a GuestMemoryMmap given a `file` containing the data
-/// and a `state` containing mapping information.
+// MADV_COLLAPSE - synchronously collapse pages to THP (Linux 6.1+)
+// Not defined in older libc versions, so we define it manually.
+#[cfg(target_os = "linux")]
+const MADV_COLLAPSE: libc::c_int = 25;
+
+/// Creates a GuestMemoryMmap given a `file` containing the data.
+/// If `shared`, uses MAP_SHARED (for live migration). If `thp`, uses MADV_HUGEPAGE
+/// and attempts MADV_COLLAPSE for immediate THP promotion (Linux 6.1+).
 pub fn snapshot_file(
     file: File,
     regions: impl Iterator<Item = (GuestAddress, usize)>,
     track_dirty_pages: bool,
+    shared: bool,
+    thp: bool,
 ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
-    create(regions, libc::MAP_PRIVATE, Some(file), track_dirty_pages)
+    let flags = if shared {
+        libc::MAP_NORESERVE | libc::MAP_SHARED
+    } else {
+        libc::MAP_NORESERVE | libc::MAP_PRIVATE
+    };
+
+    let guest_regions = create(regions, flags, Some(file), track_dirty_pages)?;
+
+    for region in &guest_regions {
+        let ptr = region.as_ptr().cast::<libc::c_void>();
+        let size = region.size();
+
+        // SAFETY: The pointer and size are valid from a valid GuestRegionMmap.
+        unsafe {
+            // Exclude from core dumps (guest memory can be very large)
+            libc::madvise(ptr, size, libc::MADV_DONTDUMP);
+
+            // Request transparent hugepages if enabled
+            if thp {
+                libc::madvise(ptr, size, libc::MADV_HUGEPAGE);
+
+                // MADV_COLLAPSE (Linux 6.1+) - synchronously collapse to huge pages
+                // This provides immediate THP benefits instead of waiting for khugepaged.
+                // Ignore failures (older kernels, unaligned regions, or low memory).
+                libc::madvise(ptr, size, MADV_COLLAPSE);
+            }
+        }
+    }
+
+    Ok(guest_regions)
 }
 
 /// Defines the interface for snapshotting memory.
@@ -158,6 +195,13 @@ where
 
     /// Store the dirty bitmap in internal store
     fn store_dirty_bitmap(&self, dirty_bitmap: &DirtyBitmap, page_size: usize);
+
+    /// Flushes memory contents to the backing file using msync (synchronous).
+    fn msync(&self) -> Result<(), MemoryError>;
+
+    /// Initiates async flush of memory contents to the backing file.
+    /// Returns immediately; use msync() for synchronous flush.
+    fn msync_async(&self) -> Result<(), MemoryError>;
 }
 
 /// State of a guest memory region saved to file/buffer.
@@ -307,6 +351,34 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                 }
             }
         });
+    }
+
+    fn msync(&self) -> Result<(), MemoryError> {
+        for region in self.iter() {
+            // SAFETY: The pointer and size are valid from a valid GuestRegionMmap.
+            unsafe {
+                libc::msync(
+                    region.as_ptr().cast::<libc::c_void>(),
+                    region.size(),
+                    libc::MS_SYNC,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn msync_async(&self) -> Result<(), MemoryError> {
+        for region in self.iter() {
+            // SAFETY: The pointer and size are valid from a valid GuestRegionMmap.
+            unsafe {
+                libc::msync(
+                    region.as_ptr().cast::<libc::c_void>(),
+                    region.size(),
+                    libc::MS_ASYNC,
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -563,7 +635,7 @@ mod tests {
         guest_memory.dump(&mut memory_file).unwrap();
 
         let restored_guest_memory = GuestMemoryMmap::from_regions(
-            snapshot_file(memory_file, memory_state.regions(), false).unwrap(),
+            snapshot_file(memory_file, memory_state.regions(), false, false, false).unwrap(),
         )
         .unwrap();
 
@@ -625,7 +697,7 @@ mod tests {
 
         // We can restore from this because this is the first dirty dump.
         let restored_guest_memory = GuestMemoryMmap::from_regions(
-            snapshot_file(file, memory_state.regions(), false).unwrap(),
+            snapshot_file(file, memory_state.regions(), false, false, false).unwrap(),
         )
         .unwrap();
 

@@ -821,6 +821,26 @@ impl RuntimeApiController {
                     elapsed_time_us
                 );
             }
+            SnapshotType::Msync => {
+                let elapsed_time_us = update_metric_with_elapsed_time(
+                    &METRICS.latencies_us.vmm_msync_create_snapshot,
+                    create_start_us,
+                );
+                info!(
+                    "'create msync snapshot' VMM action took {} us.",
+                    elapsed_time_us
+                );
+            }
+            SnapshotType::MsyncAndState => {
+                let elapsed_time_us = update_metric_with_elapsed_time(
+                    &METRICS.latencies_us.vmm_msync_and_state_create_snapshot,
+                    create_start_us,
+                );
+                info!(
+                    "'create msync and state snapshot' VMM action took {} us.",
+                    elapsed_time_us
+                );
+            }
         }
         Ok(VmmData::Empty)
     }
@@ -1297,6 +1317,9 @@ mod tests {
                 enable_diff_snapshots: false,
                 resume_vm: false,
                 network_overrides: vec![],
+                shared: false,
+                thp: false,
+                direct_io: false,
             },
         )));
         check_unsupported(runtime_request(VmmAction::SetEntropyDevice(

@@ -51,6 +51,8 @@ class SnapshotType(Enum):
 
     FULL = "Full"
     DIFF = "Diff"
+    MSYNC = "Msync"
+    MSYNC_AND_STATE = "MsyncAndState"
 
     def __repr__(self):
         cls_name = self.__class__.__name__
@@ -72,7 +74,7 @@ class Snapshot:
     """A Firecracker snapshot"""
 
     vmstate: Path
-    mem: Path
+    mem: Path | None  # None for msync snapshots (memory synced to original file)
     net_ifaces: list
     disks: dict
     ssh_key: Path
@@ -83,6 +85,11 @@ class Snapshot:
     def is_diff(self) -> bool:
         """Is this a DIFF snapshot?"""
         return self.snapshot_type == SnapshotType.DIFF
+
+    @property
+    def is_msync(self) -> bool:
+        """Is this an Msync snapshot?"""
+        return self.snapshot_type in (SnapshotType.MSYNC, SnapshotType.MSYNC_AND_STATE)
 
     def rebase_snapshot(self, base, use_snapshot_editor=False):
         """Rebases current incremental snapshot onto a specified base layer."""
@@ -101,8 +108,11 @@ class Snapshot:
         Move all the snapshot files into the microvm jail.
         Use different names so a snapshot doesn't overwrite our original snapshot.
         """
-        mem_src = chroot / self.mem.with_suffix(".src").name
-        hardlink_or_copy(self.mem, mem_src)
+        mem_src = None
+        if self.mem is not None:
+            mem_src = chroot / self.mem.with_suffix(".src").name
+            hardlink_or_copy(self.mem, mem_src)
+
         vmstate_src = chroot / self.vmstate.with_suffix(".src").name
         hardlink_or_copy(self.vmstate, vmstate_src)
 
@@ -969,13 +979,53 @@ class Microvm:
         """Make a Full snapshot"""
         return self.make_snapshot("Full", mem_path=mem_path, vmstate_path=vmstate_path)
 
+    def snapshot_msync(self, *, vmstate_path="vmstate"):
+        """Create an Msync snapshot (syncs memory to backing file, saves state).
+
+        This is used for live migration when memory is backed by a shared file.
+        The memory file path is the one used during restore with shared=True.
+        """
+        self.pause()
+        self.api.snapshot_create.put(
+            snapshot_path=str(vmstate_path),
+            snapshot_type=SnapshotType.MSYNC_AND_STATE.value,
+        )
+        root = Path(self.chroot())
+        # For msync snapshots, the mem file is the one passed during restore
+        return Snapshot(
+            vmstate=root / vmstate_path,
+            mem=None,  # Memory is synced to the original backing file
+            disks=self.disks,
+            net_ifaces=[x["iface"] for ifname, x in self.iface.items()],
+            ssh_key=self.ssh_key,
+            snapshot_type=SnapshotType.MSYNC_AND_STATE,
+            meta={
+                "kernel_file": str(self.kernel_file),
+                "vcpus_count": self.vcpus_count,
+            },
+        )
+
     def restore_from_snapshot(
         self,
         snapshot: Snapshot = None,
         resume: bool = False,
         rename_interfaces: dict = None,
+        shared: bool = False,
+        thp: bool = False,
+        direct_io: bool = False,
+        mem_file_path: Path = None,
     ):
-        """Restore a snapshot"""
+        """Restore a snapshot.
+
+        Args:
+            snapshot: Snapshot object to restore from
+            resume: Whether to resume the VM after restore
+            rename_interfaces: Dict mapping interface IDs to new host device names
+            shared: Use MAP_SHARED for memory (for live migration with msync)
+            thp: Enable transparent hugepages (MADV_HUGEPAGE + MADV_COLLAPSE)
+            direct_io: Use O_DIRECT when opening memory file
+            mem_file_path: Override memory file path (for msync snapshots)
+        """
         if self.uffd_handler is None:
             assert (
                 snapshot is not None
@@ -985,7 +1035,17 @@ class Microvm:
         else:
             jailed_snapshot = self.uffd_handler.snapshot
 
-        jailed_mem = Path("/") / jailed_snapshot.mem.name
+        # Determine memory file path:
+        # 1. If mem_file_path is provided, use it as override (for block device testing)
+        # 2. Otherwise use the snapshot's mem file
+        # 3. For msync snapshots, mem may be None - require mem_file_path
+        if mem_file_path is not None:
+            jailed_mem = mem_file_path
+        elif jailed_snapshot.mem is not None:
+            jailed_mem = Path("/") / jailed_snapshot.mem.name
+        else:
+            raise ValueError("Memory file path required for msync snapshots")
+
         jailed_vmstate = Path("/") / jailed_snapshot.vmstate.name
 
         snapshot_disks = [v for k, v in jailed_snapshot.disks.items()]
@@ -1021,11 +1081,13 @@ class Microvm:
 
         optional_kwargs = {}
         if iface_overrides:
-            # For backwards compatibility ab testing we want to avoid adding
-            # new parameters until we have a release baseline with the new
-            # parameter. Once the release baseline has moved, this assignment
-            # can be inline in the snapshot_load command below
             optional_kwargs["network_overrides"] = iface_overrides
+        if shared:
+            optional_kwargs["shared"] = shared
+        if thp:
+            optional_kwargs["thp"] = thp
+        if direct_io:
+            optional_kwargs["direct_io"] = direct_io
 
         self.api.snapshot_load.put(
             mem_backend=mem_backend,

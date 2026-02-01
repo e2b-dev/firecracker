@@ -69,6 +69,8 @@ pub(crate) fn remove_range(
     guest_memory: &GuestMemoryMmap,
     range: (GuestAddress, u64),
     restored_from_file: bool,
+    shared_memory: bool,
+    thp_enabled: bool,
 ) -> Result<(), RemoveRegionError> {
     let (guest_address, range_len) = range;
 
@@ -80,15 +82,36 @@ pub(crate) fn remove_range(
             .get_host_address(guest_address)
             .map_err(|_| RemoveRegionError::AddressTranslation)?;
 
+        let range_len_usize = u64_to_usize(range_len);
+
+        // For shared memory backed by a file/block device, use MADV_REMOVE to
+        // actually punch a hole in the backing store and free the space.
+        if shared_memory {
+            // SAFETY: The address and length are known to be valid.
+            let ret = unsafe {
+                libc::madvise(phys_address.cast(), range_len_usize, libc::MADV_REMOVE)
+            };
+            // MADV_REMOVE may fail if the backing doesn't support hole punching.
+            // Fall through to MADV_DONTNEED as a fallback.
+            if ret == 0 {
+                return Ok(());
+            }
+            // Log but continue - we'll try MADV_DONTNEED as fallback
+            crate::logger::warn!(
+                "MADV_REMOVE failed ({}), falling back to MADV_DONTNEED",
+                io::Error::last_os_error()
+            );
+        }
+
         // Mmap a new anonymous region over the present one in order to create a hole.
         // This workaround is (only) needed after resuming from a snapshot because the guest memory
         // is mmaped from file as private and there is no `madvise` flag that works for this case.
-        if restored_from_file {
+        if restored_from_file && !shared_memory {
             // SAFETY: The address and length are known to be valid.
             let ret = unsafe {
                 libc::mmap(
                     phys_address.cast(),
-                    u64_to_usize(range_len),
+                    range_len_usize,
                     libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_FIXED | libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
                     -1,
@@ -98,17 +121,21 @@ pub(crate) fn remove_range(
             if ret == libc::MAP_FAILED {
                 return Err(RemoveRegionError::MmapFail(io::Error::last_os_error()));
             }
-        };
+        }
 
         // Madvise the region in order to mark it as not used.
         // SAFETY: The address and length are known to be valid.
         let ret = unsafe {
-            let range_len = u64_to_usize(range_len);
-            libc::madvise(phys_address.cast(), range_len, libc::MADV_DONTNEED)
+            libc::madvise(phys_address.cast(), range_len_usize, libc::MADV_DONTNEED)
         };
         if ret < 0 {
             return Err(RemoveRegionError::MadviseFail(io::Error::last_os_error()));
         }
+
+        // Note: thp_enabled is passed for future use but we don't add MADV_NOHUGEPAGE
+        // as it would hurt performance when memory is re-allocated by the guest.
+        // The kernel handles THP collapse/split automatically.
+        let _ = thp_enabled;
 
         Ok(())
     } else {
@@ -184,7 +211,7 @@ mod tests {
         mem.write(&ones[..], GuestAddress(0)).unwrap();
 
         // Remove the first page.
-        remove_range(&mem, (GuestAddress(0), page_size as u64), false).unwrap();
+        remove_range(&mem, (GuestAddress(0), page_size as u64), false, false, false).unwrap();
 
         // Check that the first page is zeroed.
         let mut actual_page = vec![0u8; page_size];
@@ -198,19 +225,19 @@ mod tests {
 
         // Malformed range: the len is too big.
         assert_match!(
-            remove_range(&mem, (GuestAddress(0), 0x10000), false).unwrap_err(),
+            remove_range(&mem, (GuestAddress(0), 0x10000), false, false, false).unwrap_err(),
             RemoveRegionError::MalformedRange
         );
 
         // Region not mapped.
         assert_match!(
-            remove_range(&mem, (GuestAddress(0x10000), 0x10), false).unwrap_err(),
+            remove_range(&mem, (GuestAddress(0x10000), 0x10), false, false, false).unwrap_err(),
             RemoveRegionError::RegionNotFound
         );
 
         // Madvise fail: the guest address is not aligned to the page size.
         assert_match!(
-            remove_range(&mem, (GuestAddress(0x20), page_size as u64), false).unwrap_err(),
+            remove_range(&mem, (GuestAddress(0x20), page_size as u64), false, false, false).unwrap_err(),
             RemoveRegionError::MadviseFail(_)
         );
     }
@@ -225,7 +252,7 @@ mod tests {
         mem.write(&ones[..], GuestAddress(0)).unwrap();
 
         // Remove the first page.
-        remove_range(&mem, (GuestAddress(0), page_size as u64), true).unwrap();
+        remove_range(&mem, (GuestAddress(0), page_size as u64), true, false, false).unwrap();
 
         // Check that the first page is zeroed.
         let mut actual_page = vec![0u8; page_size];
@@ -239,19 +266,19 @@ mod tests {
 
         // Malformed range: the len is too big.
         assert_match!(
-            remove_range(&mem, (GuestAddress(0), 0x10000), true).unwrap_err(),
+            remove_range(&mem, (GuestAddress(0), 0x10000), true, false, false).unwrap_err(),
             RemoveRegionError::MalformedRange
         );
 
         // Region not mapped.
         assert_match!(
-            remove_range(&mem, (GuestAddress(0x10000), 0x10), true).unwrap_err(),
+            remove_range(&mem, (GuestAddress(0x10000), 0x10), true, false, false).unwrap_err(),
             RemoveRegionError::RegionNotFound
         );
 
         // Mmap fail: the guest address is not aligned to the page size.
         assert_match!(
-            remove_range(&mem, (GuestAddress(0x20), page_size as u64), true).unwrap_err(),
+            remove_range(&mem, (GuestAddress(0x20), page_size as u64), true, false, false).unwrap_err(),
             RemoveRegionError::MmapFail(_)
         );
     }

@@ -18,6 +18,12 @@ pub enum SnapshotType {
     /// Full snapshot.
     #[default]
     Full,
+    /// Memory synchronization snapshot (msync only, no state).
+    /// Used for live migration when memory is backed by a shared file.
+    Msync,
+    /// Memory synchronization and state snapshot.
+    /// Used for live migration with both memory sync and state save.
+    MsyncAndState,
 }
 
 /// Specifies the method through which guest memory will get populated when
@@ -74,6 +80,12 @@ pub struct LoadSnapshotParams {
     pub resume_vm: bool,
     /// The network devices to override on load.
     pub network_overrides: Vec<NetworkOverride>,
+    /// Use MAP_SHARED for guest memory (for live migration).
+    pub shared: bool,
+    /// Use madvise(MADV_HUGEPAGE) for transparent hugepages.
+    pub thp: bool,
+    /// Use O_DIRECT to bypass host page cache (for block devices).
+    pub direct_io: bool,
 }
 
 /// Stores the configuration for loading a snapshot that is provided by the user.
@@ -99,6 +111,15 @@ pub struct LoadSnapshotConfig {
     /// The network devices to override on load.
     #[serde(default)]
     pub network_overrides: Vec<NetworkOverride>,
+    /// Use MAP_SHARED for guest memory (for live migration).
+    #[serde(default)]
+    pub shared: bool,
+    /// Use madvise(MADV_HUGEPAGE) for transparent hugepages.
+    #[serde(default)]
+    pub thp: bool,
+    /// Use O_DIRECT to bypass host page cache (for block devices).
+    #[serde(default)]
+    pub direct_io: bool,
 }
 
 /// Stores the configuration used for managing snapshot memory.

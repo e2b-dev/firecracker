@@ -63,6 +63,12 @@ pub(super) struct BalloonDeviceMetrics {
     pub deflate_count: SharedIncMetric,
     /// Number of times when handling events on a balloon device failed.
     pub event_fails: SharedIncMetric,
+    /// Number of times when free page reporting was triggered.
+    pub free_page_report_count: SharedIncMetric,
+    /// Total memory freed by the reporting driver (in bytes).
+    pub free_page_report_freed: SharedIncMetric,
+    /// Number of errors occurred while reporting.
+    pub free_page_report_fails: SharedIncMetric,
 }
 impl BalloonDeviceMetrics {
     /// Const default construction.
@@ -74,6 +80,9 @@ impl BalloonDeviceMetrics {
             stats_update_fails: SharedIncMetric::new(),
             deflate_count: SharedIncMetric::new(),
             event_fails: SharedIncMetric::new(),
+            free_page_report_count: SharedIncMetric::new(),
+            free_page_report_freed: SharedIncMetric::new(),
+            free_page_report_fails: SharedIncMetric::new(),
         }
     }
 }

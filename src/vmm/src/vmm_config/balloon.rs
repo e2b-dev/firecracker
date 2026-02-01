@@ -99,6 +99,10 @@ impl BalloonBuilder {
             // `restored` flag is false because this code path
             // is never called by snapshot restore functionality.
             false,
+            // `shared_memory` flag is false for new VMs.
+            false,
+            // `thp_enabled` flag is false for new VMs (configured separately).
+            false,
         )?)));
 
         Ok(())
@@ -186,7 +190,7 @@ pub(crate) mod tests {
     #[test]
     fn test_set_device() {
         let mut builder = BalloonBuilder::new();
-        let balloon = Balloon::new(0, true, 0, true).unwrap();
+        let balloon = Balloon::new(0, true, 0, true, false, false).unwrap();
         builder.set_device(Arc::new(Mutex::new(balloon)));
         assert!(builder.inner.is_some());
     }

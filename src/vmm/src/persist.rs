@@ -34,7 +34,9 @@ use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, SnapshotType,
+};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory;
 use crate::vstate::memory::{GuestMemoryState, GuestRegionMmap, MemoryError};
@@ -137,6 +139,8 @@ pub enum CreateSnapshotError {
     DirtyBitmap(#[from] vmm_sys_util::errno::Error),
     /// Cannot write memory file: {0}
     Memory(#[from] MemoryError),
+    /// Cannot msync memory file: {0}
+    MemoryMsync(MemoryError),
     /// Cannot perform {0} on the memory backing file: {1}
     MemoryBackingFile(&'static str, io::Error),
     /// Cannot save the microVM state: {0}
@@ -156,11 +160,14 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
-    let microvm_state = vmm
-        .save_state(vm_info)
-        .map_err(CreateSnapshotError::MicrovmState)?;
+    // Save state for all snapshot types except Msync (memory-only sync)
+    if params.snapshot_type != SnapshotType::Msync {
+        let microvm_state = vmm
+            .save_state(vm_info)
+            .map_err(CreateSnapshotError::MicrovmState)?;
 
-    snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
+        snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
+    }
 
     // Dump memory to file only if mem_file_path is specified
     if let Some(ref mem_file_path) = params.mem_file_path {
@@ -387,8 +394,15 @@ pub fn restore_from_snapshot(
                 .into());
             }
             (
-                guest_memory_from_file(mem_backend_path, mem_state, track_dirty_pages)
-                    .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
+                guest_memory_from_file(
+                    mem_backend_path,
+                    mem_state,
+                    track_dirty_pages,
+                    params.shared,
+                    params.thp,
+                    params.direct_io,
+                )
+                .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
                 None,
             )
         }
@@ -408,6 +422,8 @@ pub fn restore_from_snapshot(
         uffd,
         seccomp_filters,
         vm_resources,
+        params.shared,
+        params.thp,
     )
     .map_err(RestoreFromSnapshotError::Build)
 }
@@ -454,9 +470,32 @@ fn guest_memory_from_file(
     mem_file_path: &Path,
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
+    shared: bool,
+    thp: bool,
+    direct_io: bool,
 ) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
-    let mem_file = File::open(mem_file_path)?;
-    let guest_mem = memory::snapshot_file(mem_file, mem_state.regions(), track_dirty_pages)?;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+
+    if shared {
+        opts.write(true);
+    }
+
+    if direct_io {
+        opts.custom_flags(libc::O_DIRECT);
+    }
+
+    let mem_file = opts.open(mem_file_path)?;
+
+    let guest_mem = memory::snapshot_file(
+        mem_file,
+        mem_state.regions(),
+        track_dirty_pages,
+        shared,
+        thp,
+    )?;
     Ok(guest_mem)
 }
 

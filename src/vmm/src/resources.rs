@@ -1443,7 +1443,7 @@ mod tests {
             .unwrap();
         let err = vm_resources
             .update_from_restored_device(SharedDeviceType::Balloon(Arc::new(Mutex::new(
-                Balloon::new(128, false, 0, true).unwrap(),
+                Balloon::new(128, false, 0, true, false, false).unwrap(),
             ))))
             .unwrap_err();
         assert!(

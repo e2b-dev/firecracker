@@ -4,7 +4,9 @@
 use event_manager::{EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::epoll::EventSet;
 
-use super::{DEFLATE_INDEX, INFLATE_INDEX, STATS_INDEX, report_balloon_event_fail};
+use super::{
+    DEFLATE_INDEX, INFLATE_INDEX, REPORTING_INDEX, STATS_INDEX, report_balloon_event_fail,
+};
 use crate::devices::virtio::balloon::device::Balloon;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::logger::{error, warn};
@@ -15,6 +17,7 @@ impl Balloon {
     const PROCESS_VIRTQ_DEFLATE: u32 = 2;
     const PROCESS_VIRTQ_STATS: u32 = 3;
     const PROCESS_STATS_TIMER: u32 = 4;
+    const PROCESS_VIRTQ_REPORTING: u32 = 5;
 
     fn register_runtime_events(&self, ops: &mut EventOps) {
         if let Err(err) = ops.add(Events::with_data(
@@ -46,6 +49,19 @@ impl Balloon {
             )) {
                 error!("Failed to register stats timerfd event: {}", err);
             }
+        }
+        // Register reporting queue event. Index depends on whether stats are enabled.
+        let reporting_idx = if self.stats_enabled() {
+            REPORTING_INDEX
+        } else {
+            REPORTING_INDEX - 1
+        };
+        if let Err(err) = ops.add(Events::with_data(
+            &self.queue_evts[reporting_idx],
+            Self::PROCESS_VIRTQ_REPORTING,
+            EventSet::IN,
+        )) {
+            error!("Failed to register reporting queue event: {}", err);
         }
     }
 
@@ -103,6 +119,9 @@ impl MutEventSubscriber for Balloon {
                 Self::PROCESS_STATS_TIMER => self
                     .process_stats_timer_event()
                     .unwrap_or_else(report_balloon_event_fail),
+                Self::PROCESS_VIRTQ_REPORTING => self
+                    .process_reporting_queue_event()
+                    .unwrap_or_else(report_balloon_event_fail),
                 _ => {
                     warn!("Balloon: Spurious event received: {:?}", source);
                 }
@@ -142,7 +161,7 @@ pub mod tests {
     #[test]
     fn test_event_handler() {
         let mut event_manager = EventManager::new().unwrap();
-        let mut balloon = Balloon::new(0, true, 10, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 10, false, false, false).unwrap();
         let mem = default_mem();
         let infq = VirtQueue::new(GuestAddress(0), &mem, 16);
         balloon.set_queue(INFLATE_INDEX, infq.create_queue());
