@@ -305,7 +305,7 @@ impl Vm {
     }
 
     /// Retrieves the KVM dirty bitmap for each of the guest's memory regions.
-    pub fn get_dirty_bitmap(&self) -> Result<DirtyBitmap, VmError> {
+    pub fn get_dirty_bitmap(&self, page_size: usize) -> Result<DirtyBitmap, VmError> {
         self.guest_memory()
             .iter()
             .flat_map(|region| region.plugged_slots())
@@ -318,6 +318,7 @@ impl Vm {
                     None => mincore_bitmap(
                         mem_slot.slice.ptr_guard_mut().as_ptr(),
                         mem_slot.slice.len(),
+                        page_size,
                     )?,
                 };
                 Ok((mem_slot.slot, bitmap))
@@ -335,6 +336,7 @@ impl Vm {
         &self,
         mem_file_path: &Path,
         snapshot_type: SnapshotType,
+        page_size: usize,
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
@@ -377,7 +379,7 @@ impl Vm {
 
         match snapshot_type {
             SnapshotType::Diff => {
-                let dirty_bitmap = self.get_dirty_bitmap()?;
+                let dirty_bitmap = self.get_dirty_bitmap(page_size)?;
                 self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
             }
             SnapshotType::Full => {
@@ -503,7 +505,11 @@ impl Vm {
 
 /// Use `mincore(2)` to overapproximate the dirty bitmap for the given memslot. To be used
 /// if a diff snapshot is requested, but dirty page tracking wasn't enabled.
-fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
+pub(crate) fn mincore_bitmap(
+    addr: *mut u8,
+    len: usize,
+    page_size: usize,
+) -> Result<Vec<u64>, VmError> {
     // TODO: Once Host 5.10 goes out of support, we can make this more robust and work on
     // swap-enabled systems, by doing mlock2(MLOCK_ONFAULT)/munlock() in this function (to
     // force swapped-out pages to get paged in, so that mincore will consider them incore).
@@ -513,8 +519,11 @@ fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
     // Mincore always works at PAGE_SIZE granularity, even if the VMA we are dealing with
     // is a hugetlbfs VMA (e.g. to report a single hugepage as "present", mincore will
     // give us 512 4k markers with the lowest bit set).
-    let page_size = host_page_size();
-    let mut mincore_bitmap = vec![0u8; len / page_size];
+    let host_page_size = host_page_size();
+    let mut mincore_bitmap = vec![0u8; len / host_page_size];
+    // The bitmap we return though tracks pages in terms of the actually used page size. In
+    // the case of a hugetlbfs VMA, we just need to check if the first of the reported pages
+    // is present.
     let mut bitmap = vec![0u64; (len / page_size).div_ceil(64)];
 
     // SAFETY: The safety invariants of GuestRegionMmap ensure that region.as_ptr() is a valid
@@ -529,7 +538,8 @@ fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
         return Err(VmError::Mincore(vmm_sys_util::errno::Error::last()));
     }
 
-    for (page_idx, b) in mincore_bitmap.iter().enumerate() {
+    let step = page_size / host_page_size;
+    for (page_idx, b) in mincore_bitmap.iter().step_by(step).enumerate() {
         bitmap[page_idx / 64] |= (*b as u64 & 0x1) << (page_idx as u64 % 64);
     }
 

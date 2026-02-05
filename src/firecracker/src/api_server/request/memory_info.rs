@@ -1,4 +1,4 @@
-use micro_http::{Method, StatusCode};
+use micro_http::Method;
 use vmm::rpc_interface::VmmAction;
 
 use crate::api_server::parsed_request::{ParsedRequest, RequestError};
@@ -13,9 +13,6 @@ where
             format!("/memory/{}", unknown_path),
             Method::Get,
         )),
-        None => Err(RequestError::Generic(
-            StatusCode::BadRequest,
-            "Missing memory info type.".to_string(),
-        )),
+        None => Ok(ParsedRequest::new_sync(VmmAction::GetMemory)),
     }
 }
