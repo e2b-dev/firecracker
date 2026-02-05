@@ -144,8 +144,9 @@ use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEV_ID, VirtioMem, VirtioMemError, VirtioMemStatus};
 use crate::devices::virtio::net::Net;
 use crate::logger::{METRICS, MetricsError, error, info, warn};
-use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
+use crate::persist::{GuestRegionUffdMapping, MicrovmState, MicrovmStateError, VmInfo};
 use crate::rate_limiter::BucketUpdate;
+use crate::utils::usize_to_u64;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use crate::vstate::vcpu::VcpuState;
@@ -689,6 +690,27 @@ impl Vmm {
     #[cfg(feature = "gdb")]
     pub fn vm(&self) -> &Vm {
         &self.vm
+    }
+
+    /// Get the list of mappings for guest memory
+    pub fn guest_memory_mappings(&self, page_size: usize) -> Vec<GuestRegionUffdMapping> {
+        let mut mappings = vec![];
+        let mut offset = 0;
+
+        for region in self.vm.guest_memory().iter() {
+            #[allow(deprecated)]
+            mappings.push(GuestRegionUffdMapping {
+                base_host_virt_addr: region.as_ptr() as u64,
+                size: region.size(),
+                offset,
+                page_size,
+                page_size_kib: page_size,
+            });
+
+            offset += usize_to_u64(region.size());
+        }
+
+        mappings
     }
 }
 
