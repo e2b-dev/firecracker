@@ -28,9 +28,9 @@ use crate::vmm_config::balloon::{
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
-use crate::vmm_config::instance_info::InstanceInfo;
+use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::meminfo::{MemoryMapingsResponse, MemoryResponse};
+use crate::vmm_config::meminfo::{MemoryDirty, MemoryMapingsResponse, MemoryResponse};
 use crate::vmm_config::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugSizeUpdate,
 };
@@ -151,6 +151,8 @@ pub enum VmmAction {
     GetMemoryMappings,
     /// Get guest memory resident and empty pages information
     GetMemory,
+    /// Get guest memory dirty pages information
+    GetMemoryDirty,
 }
 
 /// Wrapper for all errors associated with VMM actions.
@@ -202,6 +204,8 @@ pub enum VmmActionError {
     OperationNotSupportedPostBoot,
     /// The requested operation is not supported before starting the microVM.
     OperationNotSupportedPreBoot,
+    /// The requested operation is not supported while the microVM is running.
+    OperationNotSupportedWhileRunning,
     /// Start microvm error: {0}
     StartMicrovm(#[from] StartMicrovmError),
     /// Vsock config error: {0}
@@ -237,6 +241,8 @@ pub enum VmmData {
     MemoryMappings(MemoryMapingsResponse),
     /// The guest memory resident and empty pages information
     Memory(MemoryResponse),
+    /// The guest memory dirty pages information
+    MemoryDirty(MemoryDirty),
 }
 
 /// Trait used for deduplicating the MMDS request handling across the two ApiControllers.
@@ -506,7 +512,8 @@ impl<'a> PrebootApiController<'a> {
             | GetFreePageHintingStatus
             | StopFreePageHinting
             | GetMemoryMappings
-            | GetMemory => Err(VmmActionError::OperationNotSupportedPreBoot),
+            | GetMemory
+            | GetMemoryDirty => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
         }
@@ -784,6 +791,7 @@ impl RuntimeApiController {
                 .map_err(VmmActionError::MemoryHotplugUpdate),
             GetMemoryMappings => self.get_guest_memory_mappings(),
             GetMemory => self.get_guest_memory_info(),
+            GetMemoryDirty => self.get_dirty_memory_info(),
             // Operations not allowed post-boot.
             ConfigureBootSource(_)
             | ConfigureLogger(_)
@@ -965,6 +973,20 @@ impl RuntimeApiController {
         let page_size = self.vm_resources.machine_config.huge_pages.page_size();
         let (resident, empty) = vmm.guest_memory_info(page_size)?;
         Ok(VmmData::Memory(MemoryResponse { resident, empty }))
+    }
+
+    /// Get dirty pages information for guest memory
+    fn get_dirty_memory_info(&self) -> Result<VmmData, VmmActionError> {
+        let vmm = self.vmm.lock().expect("Poisoned lock");
+        
+        // Check if VM is paused
+        if vmm.instance_info.state != VmState::Paused {
+            return Err(VmmActionError::OperationNotSupportedWhileRunning);
+        }
+        
+        let page_size = self.vm_resources.machine_config.huge_pages.page_size();
+        let bitmap = vmm.get_dirty_memory(page_size)?;
+        Ok(VmmData::MemoryDirty(MemoryDirty { bitmap }))
     }
 }
 
