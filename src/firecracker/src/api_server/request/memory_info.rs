@@ -9,6 +9,7 @@ where
 {
     match path_tokens.next() {
         Some("mappings") => Ok(ParsedRequest::new_sync(VmmAction::GetMemoryMappings)),
+        Some("dirty") => Ok(ParsedRequest::new_sync(VmmAction::GetMemoryDirty)),
         Some(unknown_path) => Err(RequestError::InvalidPathMethod(
             format!("/memory/{}", unknown_path),
             Method::Get,

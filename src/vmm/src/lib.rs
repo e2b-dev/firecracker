@@ -256,6 +256,8 @@ pub enum VmmError {
     Block(#[from] BlockError),
     /// Balloon: {0}
     Balloon(#[from] BalloonError),
+    /// Pagemap error: {0}
+    Pagemap(#[from] utils::pagemap::PagemapError),
     /// Failed to create memory hotplug device: {0}
     VirtioMem(#[from] VirtioMemError),
 }
@@ -773,6 +775,49 @@ impl Vmm {
         }
 
         Ok((resident, empty))
+    }
+
+    /// Get dirty pages bitmap for guest memory
+    pub fn get_dirty_memory(&self, page_size: usize) -> Result<Vec<u64>, VmmError> {
+        let pagemap = utils::pagemap::PagemapReader::new(page_size)?;
+        let mut dirty_bitmap = vec![];
+
+        for mem_slot in self
+            .vm
+            .guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+        {
+            let base_addr = mem_slot.slice.ptr_guard_mut().as_ptr() as usize;
+            let len = mem_slot.slice.len();
+            let nr_pages = len / page_size;
+
+            // Use mincore_bitmap to get resident pages at guest page size granularity
+            let resident_bitmap = vstate::vm::mincore_bitmap(base_addr as *mut u8, len, page_size)?;
+
+            // TODO: if we don't support UFFD/async WP, we can completely skip this bit. For the
+            // time being, we always do.
+            //
+            // Build dirty bitmap: check pagemap only for pages that mincore reports resident.
+            // This way we reduce the amount of times we read out of /proc/<pid>/pagemap.
+            let mut slot_bitmap = vec![0u64; nr_pages.div_ceil(64)];
+            for page_idx in 0..nr_pages {
+                // Check if page is resident in the bitmap.
+                // TODO: These operations (add to bitmap, check for presence, etc.) merit their own
+                // implementation, somewhere within a bitmap type).
+                let is_resident = (resident_bitmap[page_idx / 64] & (1u64 << (page_idx % 64))) != 0;
+                if is_resident {
+                    let virt_addr = base_addr + (page_idx * page_size);
+                    if pagemap.is_page_dirty(virt_addr)? {
+                        slot_bitmap[page_idx / 64] |= 1u64 << (page_idx % 64);
+                    }
+                }
+            }
+
+            dirty_bitmap.extend_from_slice(&slot_bitmap);
+        }
+
+        Ok(dirty_bitmap)
     }
 }
 
