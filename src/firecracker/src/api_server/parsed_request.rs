@@ -199,6 +199,7 @@ impl ParsedRequest {
                 ),
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
                 VmmData::MemoryMappings(mappings) => Self::success_response_with_data(mappings),
+                VmmData::Memory(meminfo) => Self::success_response_with_data(meminfo),
             },
             Err(vmm_action_error) => {
                 let mut response = match vmm_action_error {
@@ -615,6 +616,9 @@ pub mod tests {
                 ),
                 VmmData::MemoryMappings(mappings) => {
                     http_response(&serde_json::to_string(mappings).unwrap(), 200)
+                }
+                VmmData::Memory(meminfo) => {
+                    http_response(&serde_json::to_string(meminfo).unwrap(), 200)
                 }
             };
             let response = ParsedRequest::convert_to_response(&data);

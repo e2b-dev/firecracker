@@ -152,6 +152,7 @@ use crate::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use crate::vstate::vcpu::VcpuState;
 pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
 pub use crate::vstate::vm::Vm;
+use crate::vstate::vm::mincore_bitmap;
 
 /// Shorthand type for the EventManager flavour used by Firecracker.
 pub type EventManager = BaseEventManager<Arc<Mutex<dyn MutEventSubscriber>>>;
@@ -314,6 +315,8 @@ pub struct Vmm {
     vcpus_exit_evt: EventFd,
     // Device manager
     device_manager: DeviceManager,
+    /// Page size used for backing guest memory
+    pub page_size: usize,
 }
 
 impl Vmm {
@@ -697,20 +700,79 @@ impl Vmm {
         let mut mappings = vec![];
         let mut offset = 0;
 
-        for region in self.vm.guest_memory().iter() {
+        for region in self
+            .vm
+            .guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+        {
+            let size = region.slice.len();
             #[allow(deprecated)]
             mappings.push(GuestRegionUffdMapping {
-                base_host_virt_addr: region.as_ptr() as u64,
-                size: region.size(),
+                base_host_virt_addr: region.slice.ptr_guard_mut().as_ptr() as u64,
+                size,
                 offset,
                 page_size,
                 page_size_kib: page_size,
             });
 
-            offset += usize_to_u64(region.size());
+            offset += usize_to_u64(size);
         }
 
         mappings
+    }
+
+    /// Get info regarding resident and empty pages for guest memory
+    pub fn guest_memory_info(&self, page_size: usize) -> Result<(Vec<u64>, Vec<u64>), VmmError> {
+        let mut resident = vec![];
+        let mut empty = vec![];
+        let zero_page = vec![0u8; page_size];
+
+        for mem_slot in self
+            .vm
+            .guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+        {
+            debug_assert!(mem_slot.slice.len().is_multiple_of(page_size));
+            debug_assert!(
+                (mem_slot.slice.ptr_guard_mut().as_ptr() as usize).is_multiple_of(page_size)
+            );
+
+            let len = mem_slot.slice.len();
+            let nr_pages = len / page_size;
+            let addr = mem_slot.slice.ptr_guard_mut().as_ptr();
+            let mut curr_empty = vec![0u64; nr_pages.div_ceil(64)];
+            let curr_resident = mincore_bitmap(addr, mem_slot.slice.len(), page_size)?;
+
+            for page_idx in 0..nr_pages {
+                if (curr_resident[page_idx / 64] & (1u64 << (page_idx % 64))) == 0 {
+                    continue;
+                }
+
+                // SAFETY: `addr` points to a memory region that is `nr_pages * page_size` long.
+                let curr_addr = unsafe { addr.add(page_idx * page_size) };
+
+                // SAFETY: both addresses are valid and they point to a memory region
+                // that is (at least) `page_size` long
+                let ret = unsafe {
+                    libc::memcmp(
+                        curr_addr.cast::<libc::c_void>(),
+                        zero_page.as_ptr().cast::<libc::c_void>(),
+                        page_size,
+                    )
+                };
+
+                if ret == 0 {
+                    curr_empty[page_idx / 64] |= 1u64 << (page_idx % 64);
+                }
+            }
+
+            resident.extend_from_slice(&curr_resident);
+            empty.extend_from_slice(&curr_empty);
+        }
+
+        Ok((resident, empty))
     }
 }
 
