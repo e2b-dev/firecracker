@@ -1448,12 +1448,12 @@ definitions:
     type: object
     description: Response containing the bitmap (one bit per page) of dirty pages of guest memory
     required:
-      - bitmap:
+      - bitmap
     properties:
       bitmap:
         type: array
         description: The dirty bitmap as a vector of u64 values. Each bit respresents if the page is dirty.
-        itmes:
+        items:
           type: integer
           format: uint64
 
