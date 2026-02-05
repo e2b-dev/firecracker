@@ -30,6 +30,7 @@ use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, Drive
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
+use crate::vmm_config::meminfo::MemoryMapingsResponse;
 use crate::vmm_config::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugSizeUpdate,
 };
@@ -146,6 +147,8 @@ pub enum VmmAction {
     /// Update the microVM configuration (memory & vcpu) using `VmUpdateConfig` as input. This
     /// action can only be called before the microVM has booted.
     UpdateMachineConfiguration(MachineConfigUpdate),
+    /// Get the guest memory mappings to host memory
+    GetMemoryMappings,
 }
 
 /// Wrapper for all errors associated with VMM actions.
@@ -228,6 +231,8 @@ pub enum VmmData {
     VirtioMemStatus(VirtioMemStatus),
     /// The status of the virtio-balloon hinting run
     HintingStatus(HintingStatus),
+    /// The guest memory mapping information.
+    MemoryMappings(MemoryMapingsResponse),
 }
 
 /// Trait used for deduplicating the MMDS request handling across the two ApiControllers.
@@ -495,7 +500,8 @@ impl<'a> PrebootApiController<'a> {
             | UpdateNetworkInterface(_)
             | StartFreePageHinting(_)
             | GetFreePageHintingStatus
-            | StopFreePageHinting => Err(VmmActionError::OperationNotSupportedPreBoot),
+            | StopFreePageHinting
+            | GetMemoryMappings => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
         }
@@ -771,6 +777,7 @@ impl RuntimeApiController {
                 .update_memory_hotplug_size(cfg.requested_size_mib)
                 .map(|_| VmmData::Empty)
                 .map_err(VmmActionError::MemoryHotplugUpdate),
+            GetMemoryMappings => self.get_guest_memory_mappings(),
             // Operations not allowed post-boot.
             ConfigureBootSource(_)
             | ConfigureLogger(_)
@@ -936,6 +943,19 @@ impl RuntimeApiController {
             .map(|()| VmmData::Empty)
             .map_err(NetworkInterfaceError::DeviceUpdate)
             .map_err(VmmActionError::NetworkConfig)
+    }
+
+    /// Get guest memory mappings
+    fn get_guest_memory_mappings(&self) -> Result<VmmData, VmmActionError> {
+        let start_us = get_time_us(ClockType::Monotonic);
+
+        let vmm = self.vmm.lock().expect("Poisoned lock");
+        let page_size = self.vm_resources.machine_config.huge_pages.page_size();
+        let mappings = vmm.guest_memory_mappings(page_size);
+
+        let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
+        info!("'get memory mappings' VMM action took {elapsed_time_us} us.");
+        Ok(VmmData::MemoryMappings(MemoryMapingsResponse { mappings }))
     }
 }
 

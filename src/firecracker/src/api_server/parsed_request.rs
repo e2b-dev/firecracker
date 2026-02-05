@@ -31,6 +31,7 @@ use super::request::vsock::parse_put_vsock;
 use crate::api_server::request::hotplug::memory::{
     parse_get_memory_hotplug, parse_patch_memory_hotplug, parse_put_memory_hotplug,
 };
+use crate::api_server::request::memory_info::parse_get_memory;
 use crate::api_server::request::serial::parse_put_serial;
 
 #[derive(Debug)]
@@ -91,6 +92,7 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Get, "hotplug", None) if path_tokens.next() == Some("memory") => {
                 parse_get_memory_hotplug()
             }
+            (Method::Get, "memory", None) => parse_get_memory(path_tokens),
             (Method::Get, _, Some(_)) => method_to_error(Method::Get),
             (Method::Put, "actions", Some(body)) => parse_put_actions(body),
             (Method::Put, "balloon", Some(body)) => parse_put_balloon(body),
@@ -196,6 +198,7 @@ impl ParsedRequest {
                     &serde_json::json!({ "firecracker_version": version.as_str() }),
                 ),
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
+                VmmData::MemoryMappings(mappings) => Self::success_response_with_data(mappings),
             },
             Err(vmm_action_error) => {
                 let mut response = match vmm_action_error {
@@ -610,6 +613,9 @@ pub mod tests {
                     &serde_json::json!({ "firecracker_version": version.as_str() }).to_string(),
                     200,
                 ),
+                VmmData::MemoryMappings(mappings) => {
+                    http_response(&serde_json::to_string(mappings).unwrap(), 200)
+                }
             };
             let response = ParsedRequest::convert_to_response(&data);
             response.write_all(&mut buf).unwrap();
