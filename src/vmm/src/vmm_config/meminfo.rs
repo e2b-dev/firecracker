@@ -19,3 +19,11 @@ pub struct MemoryResponse {
     /// Each bit represents whether a page is empty (all 0s).
     pub empty: Vec<u64>,
 }
+
+/// Information about dirty guest memory pages
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct MemoryDirty {
+    /// Bitmap for dirty pages. The bitmap is encoded as a vector of u64 values.
+    /// Each bit represents whether a page has been written since the last snapshot.
+    pub bitmap: Vec<u64>,
+}
