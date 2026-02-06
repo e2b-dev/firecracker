@@ -161,8 +161,10 @@ pub fn create_snapshot(
 
     snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
 
-    vmm.vm
-        .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    if let Some(mem_file_path) = params.mem_file_path.as_ref() {
+        vmm.vm
+            .snapshot_memory_to_file(mem_file_path, params.snapshot_type, vmm.page_size)?;
+    }
 
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is that we don't mark pages as dirty during runtime
