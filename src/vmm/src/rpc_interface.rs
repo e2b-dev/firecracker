@@ -961,31 +961,49 @@ impl RuntimeApiController {
 
     /// Get guest memory mappings
     fn get_guest_memory_mappings(&self) -> Result<VmmData, VmmActionError> {
+        let start_us = get_time_us(ClockType::Monotonic);
+
         let vmm = self.vmm.lock().expect("Poisoned lock");
         let page_size = self.vm_resources.machine_config.huge_pages.page_size();
         let mappings = vmm.guest_memory_mappings(page_size);
+
+        let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
+        info!("'get memory mappings' VMM action took {} us.", elapsed_time_us);
+
         Ok(VmmData::MemoryMappings(MemoryMapingsResponse { mappings }))
     }
 
     /// Get resident and empty pages information for guest memory
     fn get_guest_memory_info(&self) -> Result<VmmData, VmmActionError> {
+        let start_us = get_time_us(ClockType::Monotonic);
+
         let vmm = self.vmm.lock().expect("Poisoned lock");
         let page_size = self.vm_resources.machine_config.huge_pages.page_size();
         let (resident, empty) = vmm.guest_memory_info(page_size)?;
+
+        let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
+        info!("'get memory info' VMM action took {} us.", elapsed_time_us);
+
         Ok(VmmData::Memory(MemoryResponse { resident, empty }))
     }
 
     /// Get dirty pages information for guest memory
     fn get_dirty_memory_info(&self) -> Result<VmmData, VmmActionError> {
+        let start_us = get_time_us(ClockType::Monotonic);
+
         let vmm = self.vmm.lock().expect("Poisoned lock");
-        
+
         // Check if VM is paused
         if vmm.instance_info.state != VmState::Paused {
             return Err(VmmActionError::OperationNotSupportedWhileRunning);
         }
-        
+
         let page_size = self.vm_resources.machine_config.huge_pages.page_size();
         let bitmap = vmm.get_dirty_memory(page_size)?;
+
+        let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
+        info!("'get dirty memory' VMM action took {} us.", elapsed_time_us);
+
         Ok(VmmData::MemoryDirty(MemoryDirty { bitmap }))
     }
 }
