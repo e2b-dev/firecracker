@@ -31,15 +31,15 @@ def _print_result(name, duration):
     "scenario",
     [
         ("normal_no_uffd", HugePagesConfig.NONE, False, False),
-        # ("normal_no_uffd_dirty_tracking", HugePagesConfig.NONE, False, True),
-        # ("normal_uffd", HugePagesConfig.NONE, True, False),
-        # ("hugepages_uffd", HugePagesConfig.HUGETLBFS_2MB, True, False),
+        ("normal_no_uffd_dirty_tracking", HugePagesConfig.NONE, False, True),
+        ("normal_uffd", HugePagesConfig.NONE, True, False),
+        ("hugepages_uffd", HugePagesConfig.HUGETLBFS_2MB, True, False),
     ],
     ids=[
         "normal_pages_no_uffd",
-        # "normal_pages_no_uffd_dirty_tracking",
-        # "normal_pages_uffd",
-        # "hugepages_uffd",
+        "normal_pages_no_uffd_dirty_tracking",
+        "normal_pages_uffd",
+        "hugepages_uffd",
     ],
 )
 def test_sysbench_after_snapshot_restore(
