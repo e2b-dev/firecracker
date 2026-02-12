@@ -795,7 +795,8 @@ impl Vmm {
             // Use mincore_bitmap to get resident pages at guest page size granularity
             let resident_bitmap = vstate::vm::mincore_bitmap(base_addr as *mut u8, len, page_size)?;
 
-            // TODO: if we don't support UFFD/async WP, we can completely skip this bit. For the
+            // TODO: if we don't support UFFD/async WP, we can completely skip this bit, as the
+            // UFFD handler already tracks dirty pages through the WriteProtected events. For the
             // time being, we always do.
             //
             // Build dirty bitmap: check pagemap only for pages that mincore reports resident.
