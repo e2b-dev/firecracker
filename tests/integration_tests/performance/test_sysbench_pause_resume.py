@@ -7,7 +7,6 @@ import time
 import pytest
 
 from framework.microvm import HugePagesConfig
-from framework.utils_uffd import spawn_pf_handler, uffd_handler
 
 VCPU_COUNT = 2
 MEM_SIZE_MIB = 2048
@@ -68,8 +67,7 @@ def test_sysbench_after_snapshot_restore(
     vm.spawn()
 
     if use_uffd:
-        spawn_pf_handler(vm, uffd_handler("on_demand"), snapshot)
-        vm.restore_from_snapshot(resume=True)
+        vm.restore_from_snapshot(snapshot, resume=True, uffd_handler_name="on_demand")
     else:
         vm.restore_from_snapshot(snapshot, resume=True)
 
