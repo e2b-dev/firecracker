@@ -513,6 +513,10 @@ impl Vmm {
                 )
             };
 
+            // TODO: if we don't support UFFD/async WP, we can completely skip this bit, as the
+            // UFFD handler already tracks dirty pages through the WriteProtected events. For the
+            // time being, we always do.
+            //
             // Build dirty bitmap: check pagemap only for pages that mincore reports resident.
             let mut slot_bitmap = vec![0u64; nr_pages.div_ceil(64)];
             for page_idx in 0..nr_pages {

@@ -622,7 +622,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "timerfd",
- "userfaultfd",
+ "userfaultfd 0.8.1",
  "utils",
  "vmm",
  "vmm-sys-util",
@@ -1456,7 +1456,20 @@ dependencies = [
  "libc",
  "nix 0.27.1",
  "thiserror",
- "userfaultfd-sys",
+ "userfaultfd-sys 0.5.0",
+]
+
+[[package]]
+name = "userfaultfd"
+version = "0.9.0"
+source = "git+https://github.com/e2b-dev/userfaultfd-rs?branch=feat_write_protection#9f4f7b42adbb9bea59016f4af248ed547cf160f0"
+dependencies = [
+ "bitflags 2.6.0",
+ "cfg-if",
+ "libc",
+ "nix 0.27.1",
+ "thiserror",
+ "userfaultfd-sys 0.6.0",
 ]
 
 [[package]]
@@ -1466,6 +1479,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d75595d2a62b7db16bd47f5a1ce14e1fe05ccbe27d6c96721a958e0a027cad41"
 dependencies = [
  "bindgen 0.68.1",
+ "cc",
+ "cfg-if",
+]
+
+[[package]]
+name = "userfaultfd-sys"
+version = "0.6.0"
+source = "git+https://github.com/e2b-dev/userfaultfd-rs?branch=feat_write_protection#9f4f7b42adbb9bea59016f4af248ed547cf160f0"
+dependencies = [
+ "bindgen 0.69.4",
  "cc",
  "cfg-if",
 ]
@@ -1602,7 +1625,7 @@ dependencies = [
  "slab",
  "thiserror",
  "timerfd",
- "userfaultfd",
+ "userfaultfd 0.9.0",
  "utils",
  "vhost",
  "vm-allocator",
