@@ -1316,7 +1316,10 @@ definitions:
     properties:
       mem_file_path:
         type: string
-        description: Path to the file that will contain the guest memory.
+        description:
+          Path to the file that will contain the guest memory. This field is
+          optional. If not specified, the guest memory will not be saved to a
+          file.
       snapshot_path:
         type: string
         description: Path to the file that will contain the microVM state.
