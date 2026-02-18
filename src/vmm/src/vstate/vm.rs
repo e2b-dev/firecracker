@@ -420,6 +420,55 @@ impl Vm {
     }
 }
 
+/// Returns a bitmap of resident guest pages at `page_size` granularity.
+///
+/// Each bit in the returned Vec<u64> represents whether the corresponding guest page
+/// (of size `page_size`) is resident in RAM.
+///
+/// # Safety
+/// `addr` must point to a valid memory region of at least `len` bytes.
+pub fn mincore_bitmap(addr: *mut u8, len: usize, page_size: usize) -> Result<Vec<u64>, VmError> {
+    let host_page_size = host_page_size();
+    let nr_pages = len / page_size;
+    let mut bitmap = vec![0u64; nr_pages.div_ceil(64)];
+
+    let mincore_pages = len.div_ceil(host_page_size);
+    let mut mincore_vec = vec![0u8; mincore_pages];
+
+    // SAFETY: addr is valid memory of length `len` owned by the caller
+    let mincore_result = unsafe {
+        libc::mincore(
+            addr.cast::<libc::c_void>(),
+            len,
+            mincore_vec.as_mut_ptr(),
+        )
+    };
+
+    for page_idx in 0..nr_pages {
+        let page_offset = page_idx * page_size;
+        let is_resident = if mincore_result == 0 {
+            let page_mincore_start = page_offset / host_page_size;
+            let page_mincore_count = page_size.div_ceil(host_page_size);
+            if page_mincore_start + page_mincore_count <= mincore_vec.len() {
+                mincore_vec[page_mincore_start..page_mincore_start + page_mincore_count]
+                    .iter()
+                    .any(|&v| (v & 0x1) != 0)
+            } else {
+                false
+            }
+        } else {
+            // If mincore failed, assume resident (conservative approach)
+            true
+        };
+
+        if is_resident {
+            bitmap[page_idx / 64] |= 1u64 << (page_idx % 64);
+        }
+    }
+
+    Ok(bitmap)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use vm_memory::GuestAddress;
