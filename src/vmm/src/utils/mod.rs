@@ -9,6 +9,8 @@ pub mod net;
 pub mod signal;
 /// Module with state machine
 pub mod sm;
+/// Module with pagemap utilities
+pub mod pagemap;
 
 use std::num::Wrapping;
 use std::result::Result;

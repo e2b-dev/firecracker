@@ -276,6 +276,8 @@ pub enum VmmError {
     VmmObserverTeardown(vmm_sys_util::errno::Error),
     /// VMGenID error: {0}
     VMGenID(#[from] VmGenIdError),
+    /// Pagemap error: {0}
+    Pagemap(#[from] utils::pagemap::PagemapError),
 }
 
 /// Shorthand type for KVM dirty page bitmap.
@@ -480,6 +482,69 @@ impl Vmm {
             offset += mem_region.size() as u64;
         }
         mappings
+    }
+
+    /// Get dirty pages bitmap for guest memory.
+    ///
+    /// Returns a bitmap where each bit represents whether a guest page has been written to
+    /// (i.e., present in RAM and not write-protected via userfaultfd). Pages are ordered
+    /// following the order of memory regions as returned by `guest_memory_mappings`.
+    pub fn get_dirty_memory(&self, page_size: usize) -> Result<Vec<u64>, VmmError> {
+        let pagemap = utils::pagemap::PagemapReader::new(page_size)?;
+        let mut dirty_bitmap = vec![];
+
+        let sys_page_size = utils::get_page_size().expect("Failed to get system page size");
+
+        for region in self.guest_memory().iter() {
+            let base_addr = region.as_ptr() as usize;
+            let len = region.size();
+            let nr_pages = len / page_size;
+
+            // Use mincore to get resident pages at guest page size granularity
+            let mincore_n = len.div_ceil(sys_page_size);
+            let mut mincore_vec = vec![0u8; mincore_n];
+
+            // SAFETY: base_addr points to a valid guest memory region we own.
+            let mincore_result = unsafe {
+                libc::mincore(
+                    base_addr as *mut libc::c_void,
+                    len,
+                    mincore_vec.as_mut_ptr(),
+                )
+            };
+
+            // Build dirty bitmap: check pagemap only for pages that mincore reports resident.
+            let mut slot_bitmap = vec![0u64; nr_pages.div_ceil(64)];
+            for page_idx in 0..nr_pages {
+                let page_offset = page_idx * page_size;
+
+                let is_resident = if mincore_result == 0 {
+                    let start = page_offset / sys_page_size;
+                    let count = page_size.div_ceil(sys_page_size);
+                    if start + count <= mincore_vec.len() {
+                        mincore_vec[start..start + count]
+                            .iter()
+                            .any(|&v| (v & 0x1) != 0)
+                    } else {
+                        false
+                    }
+                } else {
+                    // If mincore failed, assume resident (conservative)
+                    true
+                };
+
+                if is_resident {
+                    let virt_addr = base_addr + page_offset;
+                    if pagemap.is_page_dirty(virt_addr)? {
+                        slot_bitmap[page_idx / 64] |= 1u64 << (page_idx % 64);
+                    }
+                }
+            }
+
+            dirty_bitmap.extend_from_slice(&slot_bitmap);
+        }
+
+        Ok(dirty_bitmap)
     }
 
     /// Sets RDA bit in serial console

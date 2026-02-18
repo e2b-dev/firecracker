@@ -20,7 +20,7 @@ use super::request::logger::parse_put_logger;
 use super::request::machine_configuration::{
     parse_get_machine_config, parse_patch_machine_config, parse_put_machine_config,
 };
-use super::request::memory::{parse_get_memory, parse_get_memory_mappings};
+use super::request::memory::{parse_get_memory, parse_get_memory_dirty, parse_get_memory_mappings};
 use super::request::metrics::parse_put_metrics;
 use super::request::mmds::{parse_get_mmds, parse_patch_mmds, parse_put_mmds};
 use super::request::net::{parse_patch_net, parse_put_net};
@@ -85,6 +85,7 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Get, "machine-config", None) => parse_get_machine_config(),
             (Method::Get, "memory", None) => match path_tokens.next() {
                 Some("mappings") => parse_get_memory_mappings(),
+                Some("dirty") => parse_get_memory_dirty(),
                 None => parse_get_memory(),
                 _ => Err(RequestError::InvalidPathMethod(
                     request_uri.to_string(),
@@ -183,6 +184,7 @@ impl ParsedRequest {
                 VmmData::InstanceInformation(info) => Self::success_response_with_data(info),
                 VmmData::MemoryMappings(mappings) => Self::success_response_with_data(mappings),
                 VmmData::Memory(memory) => Self::success_response_with_data(memory),
+                VmmData::MemoryDirty(dirty) => Self::success_response_with_data(dirty),
                 VmmData::VmmVersion(version) => Self::success_response_with_data(
                     &serde_json::json!({ "firecracker_version": version.as_str() }),
                 ),
@@ -585,6 +587,9 @@ pub mod tests {
                 VmmData::Memory(memory) => {
                     http_response(&serde_json::to_string(memory).unwrap(), 200)
                 }
+                VmmData::MemoryDirty(dirty) => {
+                    http_response(&serde_json::to_string(dirty).unwrap(), 200)
+                }
                 VmmData::VmmVersion(version) => http_response(
                     &serde_json::json!({ "firecracker_version": version.as_str() }).to_string(),
                     200,
@@ -614,6 +619,9 @@ pub mod tests {
                 resident: vec![],
                 empty: vec![],
             },
+        ));
+        verify_ok_response_with(VmmData::MemoryDirty(
+            vmm::vmm_config::instance_info::MemoryDirty { bitmap: vec![] },
         ));
         verify_ok_response_with(VmmData::VmmVersion(String::default()));
 

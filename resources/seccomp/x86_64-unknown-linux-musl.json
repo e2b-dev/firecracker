@@ -221,6 +221,10 @@
                 "comment": "Used by get_memory_dirty_bitmap to check if memory pages are resident"
             },
             {
+                "syscall": "pread64",
+                "comment": "Used by get_dirty_memory to read pagemap entries"
+            },
+            {
                 "syscall": "mmap",
                 "comment": "Used by the VirtIO balloon device",
                 "args": [
