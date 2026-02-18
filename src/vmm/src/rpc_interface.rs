@@ -26,7 +26,9 @@ use crate::vmm_config::balloon::{
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
-use crate::vmm_config::instance_info::InstanceInfo;
+use crate::vmm_config::instance_info::{
+    InstanceInfo, MemoryDirty, MemoryMappingsResponse, MemoryResponse, VmState,
+};
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::metrics::{MetricsConfig, MetricsConfigError};
 use crate::vmm_config::mmds::{MmdsConfig, MmdsConfigError};
@@ -65,6 +67,12 @@ pub enum VmmAction {
     GetVmMachineConfig,
     /// Get microVM instance information.
     GetVmInstanceInfo,
+    /// Get memory mappings with skippable pages bitmap.
+    GetMemoryMappings,
+    /// Get memory info (resident and empty pages).
+    GetMemory,
+    /// Get guest memory dirty pages information.
+    GetMemoryDirty,
     /// Get microVM version.
     GetVmmVersion,
     /// Flush the metrics. This action can only be called after the logger has been configured.
@@ -164,6 +172,8 @@ pub enum VmmActionError {
     OperationNotSupportedPostBoot,
     /// The requested operation is not supported before starting the microVM.
     OperationNotSupportedPreBoot,
+    /// The requested operation is not supported while the microVM is running.
+    OperationNotSupportedWhileRunning,
     /// Start microvm error: {0}
     StartMicrovm(#[from] StartMicrovmError),
     /// Vsock config error: {0}
@@ -189,6 +199,12 @@ pub enum VmmData {
     MmdsValue(serde_json::Value),
     /// The microVM instance information.
     InstanceInformation(InstanceInfo),
+    /// Memory mappings with skippable pages bitmap.
+    MemoryMappings(MemoryMappingsResponse),
+    /// Memory info (resident and empty pages).
+    Memory(MemoryResponse),
+    /// The guest memory dirty pages information.
+    MemoryDirty(MemoryDirty),
     /// The microVM version.
     VmmVersion(String),
 }
@@ -419,6 +435,9 @@ impl<'a> PrebootApiController<'a> {
                 self.vm_resources.machine_config.clone(),
             )),
             GetVmInstanceInfo => Ok(VmmData::InstanceInformation(self.instance_info.clone())),
+            GetMemoryMappings | GetMemory | GetMemoryDirty => {
+                Err(VmmActionError::OperationNotSupportedPreBoot)
+            }
             GetVmmVersion => Ok(VmmData::VmmVersion(self.instance_info.vmm_version.clone())),
             InsertBlockDevice(config) => self.insert_block_device(config),
             InsertNetworkDevice(config) => self.insert_net_device(config),
@@ -647,9 +666,31 @@ impl RuntimeApiController {
             GetVmMachineConfig => Ok(VmmData::MachineConfiguration(
                 self.vm_resources.machine_config.clone(),
             )),
-            GetVmInstanceInfo => Ok(VmmData::InstanceInformation(
-                self.vmm.lock().expect("Poisoned lock").instance_info(),
-            )),
+            GetVmInstanceInfo => {
+                let locked_vmm = self.vmm.lock().expect("Poisoned lock");
+                let instance_info = locked_vmm.instance_info();
+                Ok(VmmData::InstanceInformation(instance_info))
+            }
+            GetMemoryMappings => {
+                let locked_vmm = self.vmm.lock().expect("Poisoned lock");
+                let mappings = locked_vmm
+                    .vm
+                    .guest_memory_mappings(&VmInfo::from(&self.vm_resources));
+
+                Ok(VmmData::MemoryMappings(MemoryMappingsResponse { mappings }))
+            }
+            GetMemory => {
+                let locked_vmm = self.vmm.lock().expect("Poisoned lock");
+                let (resident_bitmap, empty_bitmap) = locked_vmm
+                    .vm
+                    .get_memory_info(&VmInfo::from(&self.vm_resources))
+                    .map_err(|e| VmmActionError::InternalVmm(VmmError::Vm(e)))?;
+                Ok(VmmData::Memory(MemoryResponse {
+                    resident: resident_bitmap,
+                    empty: empty_bitmap,
+                }))
+            }
+            GetMemoryDirty => self.get_dirty_memory_info(),
             GetVmmVersion => Ok(VmmData::VmmVersion(
                 self.vmm.lock().expect("Poisoned lock").version(),
             )),
@@ -793,6 +834,27 @@ impl RuntimeApiController {
             }
         }
         Ok(VmmData::Empty)
+    }
+
+    /// Get dirty pages information for guest memory.
+    fn get_dirty_memory_info(&self) -> Result<VmmData, VmmActionError> {
+        let start_us = get_time_us(ClockType::Monotonic);
+        let vmm = self.vmm.lock().expect("Poisoned lock");
+
+        // Dirty memory can only be queried while the VM is paused
+        if vmm.instance_info.state != VmState::Paused {
+            return Err(VmmActionError::OperationNotSupportedWhileRunning);
+        }
+
+        let page_size = self.vm_resources.machine_config.huge_pages.page_size();
+        let bitmap = vmm
+            .get_dirty_memory(page_size)
+            .map_err(VmmActionError::InternalVmm)?;
+
+        let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
+        info!("'get dirty memory' VMM action took {elapsed_time_us} us.");
+
+        Ok(VmmData::MemoryDirty(MemoryDirty { bitmap }))
     }
 
     /// Updates block device properties:
@@ -1147,7 +1209,7 @@ mod tests {
             CreateSnapshotParams {
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: PathBuf::new(),
-                mem_file_path: PathBuf::new(),
+                mem_file_path: Some(PathBuf::new()),
             },
         )));
         #[cfg(target_arch = "x86_64")]

@@ -17,6 +17,7 @@ import pytest
 import host_tools.drive as drive_tools
 import host_tools.network as net_tools
 from framework import utils, utils_cpuid
+from framework.microvm import HugePagesConfig
 from framework.utils import get_firecracker_version_from_toml
 from framework.utils_cpu_templates import SUPPORTED_CPU_TEMPLATES
 
@@ -1355,3 +1356,239 @@ def test_negative_snapshot_load_api(microvm_factory):
     # The snapshot/memory files above don't exist, but the request is otherwise syntactically valid.
     # In this case, Firecracker exits.
     vm.mark_killed()
+
+
+def test_memory_mappings_pre_boot(uvm_plain):
+    """Test that memory mappings endpoint is not available before boot."""
+    test_microvm = uvm_plain
+    test_microvm.spawn()
+    test_microvm.basic_config()
+
+    # Use session directly since get() asserts on 200
+    url = test_microvm.api.endpoint + "/memory/mappings"
+    res = test_microvm.api.session.get(url)
+    assert res.status_code == 400
+    assert NOT_SUPPORTED_BEFORE_START in res.json()["fault_message"]
+
+
+def test_memory_pre_boot(uvm_plain):
+    """Test that memory endpoint is not available before boot."""
+    test_microvm = uvm_plain
+    test_microvm.spawn()
+    test_microvm.basic_config()
+
+    # Use session directly since get() asserts on 200
+    url = test_microvm.api.endpoint + "/memory"
+    res = test_microvm.api.session.get(url)
+    assert res.status_code == 400
+    assert NOT_SUPPORTED_BEFORE_START in res.json()["fault_message"]
+
+
+def test_memory_mappings_post_boot(uvm_plain):
+    """Test that memory mappings endpoint works after boot with hugepages."""
+    test_microvm = uvm_plain
+    test_microvm.spawn()
+    test_microvm.basic_config(huge_pages=HugePagesConfig.HUGETLBFS_2MB)
+    test_microvm.start()
+
+    response = test_microvm.api.memory_mappings.get()
+    assert response.status_code == 200
+
+    data = response.json()
+    assert isinstance(data, dict)
+    assert "mappings" in data
+    mappings = data["mappings"]
+    assert isinstance(mappings, list)
+    assert len(mappings) > 0
+
+    # Verify structure of each mapping
+    for mapping in mappings:
+        assert "base_host_virt_addr" in mapping
+        assert "size" in mapping
+        assert "offset" in mapping
+        assert "page_size" in mapping
+        assert isinstance(mapping["base_host_virt_addr"], int)
+        assert isinstance(mapping["size"], int)
+        assert isinstance(mapping["offset"], int)
+        assert isinstance(mapping["page_size"], int)
+        assert mapping["size"] > 0
+        # Verify page size is 2MB (2097152 bytes) for hugepages
+        assert mapping["page_size"] == 2 * 1024 * 1024
+
+
+def test_memory_post_boot(uvm_plain):
+    """Test that memory endpoint works after boot with hugepages."""
+    test_microvm = uvm_plain
+    test_microvm.spawn()
+    test_microvm.basic_config(huge_pages=HugePagesConfig.HUGETLBFS_2MB)
+    test_microvm.start()
+
+    # Get memory mappings to determine page size and total memory
+    mappings_response = test_microvm.api.memory_mappings.get()
+    assert mappings_response.status_code == 200
+    mappings_data = mappings_response.json()
+    assert isinstance(mappings_data, dict)
+    assert "mappings" in mappings_data
+    mappings = mappings_data["mappings"]
+    assert len(mappings) > 0
+
+    # All regions should have the same page size (2MB for hugepages)
+    page_size = mappings[0]["page_size"]
+    assert page_size == 2 * 1024 * 1024, "Expected 2MB page size for hugepages"
+
+    # Verify all regions have the same page size
+    for mapping in mappings:
+        assert (
+            mapping["page_size"] == page_size
+        ), "All regions must have the same page size"
+
+    total_memory_size = sum(mapping["size"] for mapping in mappings)
+    total_pages = total_memory_size // page_size
+    expected_bitmap_size = (total_pages + 63) // 64  # ceil(total_pages / 64)
+
+    # Get memory info
+    response = test_microvm.api.memory.get()
+    assert response.status_code == 200
+
+    data = response.json()
+    assert isinstance(data, dict)
+    assert "resident" in data
+    assert "empty" in data
+    resident_bitmap = data["resident"]
+    empty_bitmap = data["empty"]
+    assert isinstance(resident_bitmap, list)
+    assert isinstance(empty_bitmap, list)
+    assert len(resident_bitmap) == expected_bitmap_size
+    assert len(empty_bitmap) == expected_bitmap_size
+
+    # Verify all values are valid u64 integers
+    for value in resident_bitmap:
+        assert isinstance(value, int)
+        assert value >= 0
+        assert value <= 0xFFFFFFFFFFFFFFFF  # Max u64 value
+
+    for value in empty_bitmap:
+        assert isinstance(value, int)
+        assert value >= 0
+        assert value <= 0xFFFFFFFFFFFFFFFF  # Max u64 value
+
+    # After boot, there should be at least one resident page
+    has_resident_page = any(value != 0 for value in resident_bitmap)
+    assert has_resident_page, "Expected at least one resident page after VM boot"
+
+    # Empty pages should be a subset of resident pages
+    # (empty_bitmap & resident_bitmap) == empty_bitmap
+    for i in range(len(empty_bitmap)):
+        assert (empty_bitmap[i] & resident_bitmap[i]) == empty_bitmap[i], \
+            "Empty pages must be a subset of resident pages"
+
+
+@pytest.mark.nonci
+def test_memory_benchmark(microvm_factory, guest_kernel_linux_6_1, rootfs):
+    """Benchmark the memory endpoint performance (resident + zero page checking)."""
+    test_microvm = microvm_factory.build(guest_kernel_linux_6_1, rootfs)
+    test_microvm.spawn()
+    
+    # Use larger memory size for benchmarking
+    # Check available hugepages and use a size that fits (need at least some headroom)
+    # Default to 256MB if we can't determine, or use available - 64MB headroom
+    try:
+        with open('/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages', 'r') as f:
+            free_hugepages = int(f.read().strip())
+            # Each hugepage is 2MB, reserve 32 pages (64MB) for system
+            available_mib = max(128, (free_hugepages - 32) * 2)
+            mem_size_mib = min(1024, available_mib)  # Cap at 1GB for proper benchmark
+    except (FileNotFoundError, ValueError, OSError):
+        # Fallback to 256MB if we can't read hugepage info
+        mem_size_mib = 256
+    test_microvm.basic_config(
+        mem_size_mib=mem_size_mib,
+        huge_pages=HugePagesConfig.HUGETLBFS_2MB
+    )
+    # Add network interface for SSH access
+    test_microvm.add_net_iface()
+    test_microvm.start()
+    
+    # Get memory mappings to determine actual memory size
+    mappings_response = test_microvm.api.memory_mappings.get()
+    assert mappings_response.status_code == 200
+    mappings_data = mappings_response.json()
+    mappings = mappings_data["mappings"]
+    
+    # Calculate total memory size
+    total_memory_bytes = sum(mapping["size"] for mapping in mappings)
+    total_memory_mib = total_memory_bytes / (1024 * 1024)
+    page_size = mappings[0]["page_size"]
+    
+    # Ensure memory is resident by writing zeros to it via guest
+    # This will fault in the pages and make them resident
+    # Using tmpfs (/dev/shm) ensures the memory is actually resident
+    # Allocate a reasonable portion (e.g., 256MB) to avoid freezing the sandbox
+    fault_memory_mib = min(256, int(total_memory_mib * 0.25))  # 25% or max 256MB
+    test_microvm.ssh.run("dd if=/dev/zero of=/dev/shm/zero_mem bs=1M count={} 2>/dev/null || true".format(fault_memory_mib))
+    
+    # Give the system a moment to fault in pages
+    time.sleep(0.1)
+    
+    # Benchmark the /memory endpoint call
+    start_time = time.perf_counter()
+    response = test_microvm.api.memory.get()
+    end_time = time.perf_counter()
+    
+    assert response.status_code == 200
+    data = response.json()
+    assert "resident" in data
+    assert "empty" in data
+    
+    # Verify the response is valid
+    resident_bitmap = data["resident"]
+    empty_bitmap = data["empty"]
+    
+    # Calculate expected bitmap size
+    page_size = mappings[0]["page_size"]
+    total_pages = total_memory_bytes // page_size
+    expected_bitmap_size = (total_pages + 63) // 64
+    
+    assert len(resident_bitmap) == expected_bitmap_size
+    assert len(empty_bitmap) == expected_bitmap_size
+    
+    # Count actual resident pages (faulted-in memory)
+    resident_page_count = 0
+    for bitmap_value in resident_bitmap:
+        # Count set bits in each u64 value
+        resident_page_count += bin(bitmap_value).count('1')
+    
+    # Calculate resident memory size (actual memory that was checked)
+    resident_memory_bytes = resident_page_count * page_size
+    resident_memory_mib = resident_memory_bytes / (1024 * 1024)
+    
+    # Calculate elapsed time and throughput based on actual resident memory
+    elapsed_seconds = end_time - start_time
+    
+    if resident_memory_bytes > 0:
+        throughput_mib_per_sec = resident_memory_mib / elapsed_seconds
+        time_per_mb_ms = (elapsed_seconds * 1000) / resident_memory_mib
+    else:
+        throughput_mib_per_sec = 0
+        time_per_mb_ms = 0
+    
+    # Count empty pages
+    empty_page_count = 0
+    for bitmap_value in empty_bitmap:
+        empty_page_count += bin(bitmap_value).count('1')
+    
+    # Print benchmark results
+    print(f"\n{'='*60}")
+    print(f"Memory Benchmark Results")
+    print(f"{'='*60}")
+    print(f"Total Memory: {total_memory_mib:.2f} MiB ({total_memory_bytes / (1024**3):.3f} GB)")
+    print(f"Resident Pages: {resident_page_count} / {total_pages} ({resident_page_count * 100 / total_pages:.1f}%)")
+    print(f"Resident Memory: {resident_memory_mib:.2f} MiB ({resident_memory_bytes / (1024**3):.3f} GB)")
+    print(f"Empty Pages: {empty_page_count} / {resident_page_count} ({empty_page_count * 100 / resident_page_count if resident_page_count > 0 else 0:.1f}% of resident)")
+    print(f"Elapsed Time: {elapsed_seconds*1000:.2f} ms")
+    print(f"Throughput (resident): {throughput_mib_per_sec:.2f} MiB/s")
+    print(f"Time per MB (resident): {time_per_mb_ms:.3f} ms/MB")
+    print(f"{'='*60}\n")
+    
+    # Verify at least some pages are resident
+    assert resident_page_count > 0, "Expected at least one resident page"

@@ -13,11 +13,13 @@ use std::sync::Arc;
 
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use kvm_ioctls::VmFd;
+use serde::{Deserialize, Serialize};
 use vmm_sys_util::eventfd::EventFd;
 
+use crate::arch::host_page_size;
 pub use crate::arch::{ArchVm as Vm, ArchVmError, VmState};
 use crate::logger::info;
-use crate::persist::CreateSnapshotError;
+use crate::persist::{CreateSnapshotError, VmInfo};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::snapshot::SnapshotType;
 use crate::vstate::memory::{
@@ -34,6 +36,20 @@ pub struct VmCommon {
     max_memslots: usize,
     /// The guest memory of this Vm.
     pub guest_memory: GuestMemoryMmap,
+}
+
+/// Describes the region of guest memory that can be used for creating the memfile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GuestMemoryRegionMapping {
+    /// Base host virtual address where the guest memory contents for this region
+    /// should be copied/populated.
+    pub base_host_virt_addr: u64,
+    /// Region size.
+    pub size: usize,
+    /// Offset in the backend file/buffer where the region contents are.
+    pub offset: u64,
+    /// The configured page size for this memory region.
+    pub page_size: usize,
 }
 
 /// Errors associated with the wrappers over KVM ioctls.
@@ -55,6 +71,8 @@ pub enum VmError {
     NotEnoughMemorySlots,
     /// Memory Error: {0}
     VmMemory(#[from] vm_memory::Error),
+    /// Invalid memory configuration: {0}
+    InvalidMemoryConfiguration(String),
 }
 
 /// Contains Vm functions that are usable across CPU architectures
@@ -185,6 +203,130 @@ impl Vm {
         &self.common.guest_memory
     }
 
+    /// Gets the mappings for the guest memory.
+    pub fn guest_memory_mappings(&self, vm_info: &VmInfo) -> Vec<GuestMemoryRegionMapping> {
+        let mut offset = 0;
+        let mut mappings = Vec::new();
+        for mem_region in self.guest_memory().iter() {
+            mappings.push(GuestMemoryRegionMapping {
+                base_host_virt_addr: mem_region.as_ptr() as u64,
+                size: mem_region.size(),
+                offset,
+                page_size: vm_info.huge_pages.page_size(),
+            });
+            offset += mem_region.size() as u64;
+        }
+        mappings
+    }
+
+    /// Gets the memory info (resident and empty pages) for all memory regions.
+    /// Returns two bitmaps: resident (all resident pages) and empty (zero pages, subset of resident).
+    /// This checks at the pageSize of each region and requires all regions to have the same page size.
+    pub fn get_memory_info(&self, vm_info: &VmInfo) -> Result<(Vec<u64>, Vec<u64>), VmError> {
+        let mappings = self.guest_memory_mappings(vm_info);
+
+        if mappings.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // Check that all regions have the same page size
+        let page_size = mappings[0].page_size;
+        if mappings.iter().any(|m| m.page_size != page_size) {
+            return Err(VmError::InvalidMemoryConfiguration(
+                "All memory regions must have the same page size".to_string(),
+            ));
+        }
+
+        // Calculate total number of pages across all regions
+        let total_pages: usize = mappings.iter().map(|m| m.size / page_size).sum();
+        let bitmap_size = total_pages.div_ceil(64);
+        let mut resident_bitmap = vec![0u64; bitmap_size];
+        let mut empty_bitmap = vec![0u64; bitmap_size];
+
+        let mut global_page_idx = 0;
+
+        // SAFETY: We're reading from valid memory regions that we own
+        unsafe {
+            // Pre-allocate zero buffer once per page size (reused for all pages)
+            // This is the most important optimization - avoids repeated allocations
+            let zero_buf = vec![0u8; page_size];
+
+            let sys_page_size = host_page_size();
+
+            for mapping in &mappings {
+                // Find the memory region that matches this mapping
+                let mem_region = self
+                    .guest_memory()
+                    .iter()
+                    .find(|region| region.as_ptr() as u64 == mapping.base_host_virt_addr)
+                    .expect("Memory region not found for mapping");
+
+                let region_ptr = mem_region.as_ptr();
+                let region_size = mem_region.size();
+                let num_pages = region_size / page_size;
+
+                // Use mincore on the entire region to check residency
+                let mincore_pages = region_size.div_ceil(sys_page_size);
+                let mut mincore_vec = vec![0u8; mincore_pages];
+
+                let mincore_result = libc::mincore(
+                    region_ptr.cast::<libc::c_void>(),
+                    region_size,
+                    mincore_vec.as_mut_ptr(),
+                );
+
+                // Check each page
+                for page_idx in 0..num_pages {
+                    let page_offset = page_idx * page_size;
+                    let page_ptr = region_ptr.add(page_offset);
+
+                    // Check if page is resident using mincore
+                    let is_resident = if mincore_result == 0 {
+                        let page_mincore_start = page_offset / sys_page_size;
+                        let page_mincore_count = page_size.div_ceil(sys_page_size);
+                        if page_mincore_start + page_mincore_count <= mincore_vec.len() {
+                            // Page is resident if any 4KB sub-page is resident (check LSB only)
+                            mincore_vec[page_mincore_start..page_mincore_start + page_mincore_count]
+                                .iter()
+                                .any(|&v| (v & 0x1) != 0)
+                        } else {
+                            false
+                        }
+                    } else {
+                        // If mincore failed, assume resident (conservative approach)
+                        true
+                    };
+
+                    let bitmap_idx = global_page_idx / 64;
+                    let bit_idx = global_page_idx % 64;
+
+                    if is_resident {
+                        // Set bit in resident bitmap
+                        if bitmap_idx < resident_bitmap.len() {
+                            resident_bitmap[bitmap_idx] |= 1u64 << bit_idx;
+                        }
+
+                        // Check if page is zero (empty)
+                        let is_zero = libc::memcmp(
+                            page_ptr.cast::<libc::c_void>(),
+                            zero_buf.as_ptr().cast::<libc::c_void>(),
+                            page_size,
+                        ) == 0;
+
+                        // Set bit in empty bitmap if page is zero
+                        if is_zero && bitmap_idx < empty_bitmap.len() {
+                            empty_bitmap[bitmap_idx] |= 1u64 << bit_idx;
+                        }
+                    }
+
+                    global_page_idx += 1;
+                }
+            }
+        }
+
+        Ok((resident_bitmap, empty_bitmap))
+    }
+
     /// Resets the KVM dirty bitmap for each of the guest's memory regions.
     pub fn reset_dirty_bitmap(&self) {
         self.guest_memory()
@@ -276,6 +418,55 @@ impl Vm {
         file.sync_all()
             .map_err(|err| MemoryBackingFile("sync_all", err))
     }
+}
+
+/// Returns a bitmap of resident guest pages at `page_size` granularity.
+///
+/// Each bit in the returned Vec<u64> represents whether the corresponding guest page
+/// (of size `page_size`) is resident in RAM.
+///
+/// # Safety
+/// `addr` must point to a valid memory region of at least `len` bytes.
+pub fn mincore_bitmap(addr: *mut u8, len: usize, page_size: usize) -> Result<Vec<u64>, VmError> {
+    let host_page_size = host_page_size();
+    let nr_pages = len / page_size;
+    let mut bitmap = vec![0u64; nr_pages.div_ceil(64)];
+
+    let mincore_pages = len.div_ceil(host_page_size);
+    let mut mincore_vec = vec![0u8; mincore_pages];
+
+    // SAFETY: addr is valid memory of length `len` owned by the caller
+    let mincore_result = unsafe {
+        libc::mincore(
+            addr.cast::<libc::c_void>(),
+            len,
+            mincore_vec.as_mut_ptr(),
+        )
+    };
+
+    for page_idx in 0..nr_pages {
+        let page_offset = page_idx * page_size;
+        let is_resident = if mincore_result == 0 {
+            let page_mincore_start = page_offset / host_page_size;
+            let page_mincore_count = page_size.div_ceil(host_page_size);
+            if page_mincore_start + page_mincore_count <= mincore_vec.len() {
+                mincore_vec[page_mincore_start..page_mincore_start + page_mincore_count]
+                    .iter()
+                    .any(|&v| (v & 0x1) != 0)
+            } else {
+                false
+            }
+        } else {
+            // If mincore failed, assume resident (conservative approach)
+            true
+        };
+
+        if is_resident {
+            bitmap[page_idx / 64] |= 1u64 << (page_idx % 64);
+        }
+    }
+
+    Ok(bitmap)
 }
 
 #[cfg(test)]

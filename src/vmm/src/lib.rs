@@ -249,6 +249,8 @@ pub enum VmmError {
     VcpuMessage,
     /// Cannot spawn Vcpu thread: {0}
     VcpuSpawn(io::Error),
+    /// Pagemap error: {0}
+    Pagemap(#[from] utils::pagemap::PagemapError),
     /// Vm error: {0}
     Vm(#[from] vstate::vm::VmError),
     /// Kvm error: {0}
@@ -756,6 +758,48 @@ impl Vmm {
         } else {
             Err(BalloonError::DeviceNotFound)
         }
+    }
+
+    /// Get dirty pages bitmap for guest memory.
+    ///
+    /// Returns a bitmap (Vec<u64>) where each bit corresponds to a guest page of `page_size`.
+    /// A set bit indicates the page is present in RAM and has been written to (not write-protected).
+    /// Pages are ordered in the same order as reported by `/memory/mappings`.
+    pub fn get_dirty_memory(&self, page_size: usize) -> Result<Vec<u64>, VmmError> {
+        let pagemap = utils::pagemap::PagemapReader::new(page_size)?;
+        let mut dirty_bitmap = vec![];
+
+        for region in self.vm.guest_memory().iter() {
+            let base_addr = region.as_ptr() as usize;
+            let len = region.size() as usize;
+            let nr_pages = len / page_size;
+
+            // Use mincore to get resident pages bitmap at guest page size granularity
+            let resident_bitmap =
+                vstate::vm::mincore_bitmap(base_addr as *mut u8, len, page_size)?;
+
+            // TODO: if we support UFFD/async WP, we can completely skip this bit, as the
+            // UFFD handler already tracks dirty pages through the WriteProtected events. For the
+            // time being, we always do.
+            //
+            // Build dirty bitmap: check pagemap only for pages that mincore reports resident.
+            // This reduces the number of /proc/self/pagemap reads.
+            let mut slot_bitmap = vec![0u64; nr_pages.div_ceil(64)];
+            for page_idx in 0..nr_pages {
+                let is_resident =
+                    (resident_bitmap[page_idx / 64] & (1u64 << (page_idx % 64))) != 0;
+                if is_resident {
+                    let virt_addr = base_addr + (page_idx * page_size);
+                    if pagemap.is_page_dirty(virt_addr)? {
+                        slot_bitmap[page_idx / 64] |= 1u64 << (page_idx % 64);
+                    }
+                }
+            }
+
+            dirty_bitmap.extend_from_slice(&slot_bitmap);
+        }
+
+        Ok(dirty_bitmap)
     }
 
     /// Signals Vmm to stop and exit.
