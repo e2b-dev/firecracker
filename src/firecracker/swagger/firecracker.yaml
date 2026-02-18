@@ -647,6 +647,25 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /memory/dirty:
+    get:
+      summary: Gets the dirty pages bitmap for guest memory.
+      description: Returns a bitmap of dirty pages (pages written to since write-protection was enabled). The bitmap is encoded as a vector of u64 values where each bit represents one guest page. Pages are ordered following the order of memory regions as reported by /memory/mappings. The microVM must be paused before calling this endpoint.
+      operationId: getMemoryDirty
+      responses:
+        200:
+          description: OK
+          schema:
+            $ref: "#/definitions/MemoryDirty"
+        400:
+          description: The microVM is not paused.
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /version:
     get:
       summary: Gets the Firecracker version.
@@ -1075,6 +1094,19 @@ definitions:
       empty:
         type: array
         description: The empty bitmap as a vector of u64 values. Each bit represents if the page is zero (empty). This is a subset of the resident pages.
+        items:
+          type: integer
+          format: uint64
+
+  MemoryDirty:
+    type: object
+    description: Response containing the dirty pages bitmap for guest memory. The bitmap is structured as a vector of u64, so its length is total_number_of_pages.div_ceil(64). Pages are ordered in the order of pages as reported by /memory/mappings.
+    required:
+      - bitmap
+    properties:
+      bitmap:
+        type: array
+        description: Bitmap for dirty pages. Each bit represents whether a page has been written since write-protection was enabled.
         items:
           type: integer
           format: uint64
