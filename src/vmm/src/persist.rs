@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use userfaultfd::{FeatureFlags, RegisterMode, Uffd, UffdBuilder};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
@@ -469,6 +469,8 @@ pub enum GuestMemoryFromUffdError {
     Create(userfaultfd::Error),
     /// Failed to register memory address range with the userfaultfd object: {0}
     Register(userfaultfd::Error),
+    /// Failed to enable write protection on memory address range with the userfaultfd object: {0}
+    WriteProtect(userfaultfd::Error),
     /// Failed to connect to UDS Unix stream: {0}
     Connect(#[from] std::io::Error),
     /// Failed to sends file descriptor: {0}
@@ -490,7 +492,9 @@ fn guest_memory_from_uffd(
     // because the only place the kernel checks this is in a hook from madvise, e.g. it doesn't
     // actively change the behavior of UFFD, only passively. Without balloon devices
     // we never call madvise anyway, so no need to put this into a conditional.
-    uffd_builder.require_features(FeatureFlags::EVENT_REMOVE);
+    uffd_builder.require_features(
+        FeatureFlags::EVENT_REMOVE | FeatureFlags::MISSING_HUGETLBFS | FeatureFlags::WP_ASYNC,
+    );
 
     let uffd = uffd_builder
         .close_on_exec(true)
@@ -500,8 +504,22 @@ fn guest_memory_from_uffd(
         .map_err(GuestMemoryFromUffdError::Create)?;
 
     for mem_region in guest_memory.iter() {
-        uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
-            .map_err(GuestMemoryFromUffdError::Register)?;
+        uffd.register_with_mode(
+            mem_region.as_ptr().cast(),
+            mem_region.size() as _,
+            RegisterMode::MISSING | RegisterMode::WRITE_PROTECT,
+        )
+        .map_err(GuestMemoryFromUffdError::Register)?;
+
+        // If memory is backed by huge pages, we can immediately write protect it.
+        // Otherwise (memory is backed by anonymous memory), write protecting here
+        // won't have any effect, as the write-protection bit for a page will be
+        // wiped when the first page fault occurs. These cases need to be handled
+        // directly from the UFFD handler.
+        if huge_pages.is_hugetlbfs() {
+            uffd.write_protect(mem_region.as_ptr().cast(), mem_region.size() as _)
+                .map_err(GuestMemoryFromUffdError::WriteProtect)?;
+        }
     }
 
     send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;

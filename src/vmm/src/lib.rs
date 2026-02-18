@@ -778,6 +778,10 @@ impl Vmm {
             let resident_bitmap =
                 vstate::vm::mincore_bitmap(base_addr as *mut u8, len, page_size)?;
 
+            // TODO: if we support UFFD/async WP, we can completely skip this bit, as the
+            // UFFD handler already tracks dirty pages through the WriteProtected events. For the
+            // time being, we always do.
+            //
             // Build dirty bitmap: check pagemap only for pages that mincore reports resident.
             // This reduces the number of /proc/self/pagemap reads.
             let mut slot_bitmap = vec![0u64; nr_pages.div_ceil(64)];
