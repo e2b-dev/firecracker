@@ -9,15 +9,18 @@ license = "Apache-2.0"
 bench = false
 
 [dependencies]
-acpi_tables = { path = "../acpi-tables" } 
-aes-gcm =  { version = "0.10.1", default-features = false, features = ["aes"] }
+acpi_tables = { path = "../acpi-tables" }
+aes-gcm = { version = "0.10.1", default-features = false, features = ["aes"] }
 arrayvec = { version = "0.7.6", optional = true }
 aws-lc-rs = { version = "1.10.0", features = ["bindgen"] }
 base64 = "0.22.1"
 bincode = "1.2.1"
 bitflags = "2.6.0"
 crc64 = "2.0.0"
-derive_more = { version = "1.0.0", default-features = false, features = ["from", "display"] }
+derive_more = { version = "1.0.0", default-features = false, features = [
+  "from",
+  "display",
+] }
 displaydoc = "0.2.5"
 event-manager = "0.4.0"
 gdbstub = { version = "0.7.3", optional = true }
@@ -39,11 +42,18 @@ serde_json = "1.0.132"
 slab = "0.4.7"
 thiserror = "1.0.67"
 timerfd = "1.5.0"
-userfaultfd = "0.8.1"
+userfaultfd = { git = "https://github.com/e2b-dev/userfaultfd-rs", branch = "feat_write_protection", features = [
+  "linux5_7",
+  "linux5_13",
+  "linux6_7"
+] }
 utils = { path = "../utils" }
 vhost = { version = "0.13.0", features = ["vhost-user-frontend"] }
 vm-allocator = "0.1.0"
-vm-memory = { version = "0.16.0", features = ["backend-mmap", "backend-bitmap"] }
+vm-memory = { version = "0.16.0", features = [
+  "backend-mmap",
+  "backend-bitmap",
+] }
 vm-superio = "0.8.0"
 vmm-sys-util = { version = "0.12.1", features = ["with-serde"] }
 zerocopy = { version = "0.8.8" }
