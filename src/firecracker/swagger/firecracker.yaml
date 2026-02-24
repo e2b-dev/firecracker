@@ -824,7 +824,7 @@ paths:
         200:
           description: OK
           schema:
-            $ref: "#/definitions/MemoryDirty"
+            $ref: "#/definitions/DirtyMemory"
         default:
           description: Internal server error
           schema:
@@ -1444,7 +1444,7 @@ definitions:
           type: integer
           format: uint64
 
-  MemoryDirty:
+  DirtyMemory:
     type: object
     description: Response containing the bitmap (one bit per page) of dirty pages of guest memory
     required:
