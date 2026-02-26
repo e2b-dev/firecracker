@@ -46,13 +46,13 @@ pub struct RxBufferState {
 pub struct NetState {
     pub id: String,
     pub tap_if_name: String,
-    rx_rate_limiter_state: RateLimiterState,
-    tx_rate_limiter_state: RateLimiterState,
+    pub rx_rate_limiter_state: RateLimiterState,
+    pub tx_rate_limiter_state: RateLimiterState,
     /// The associated MMDS network stack.
     pub mmds_ns: Option<MmdsNetworkStackState>,
-    config_space: NetConfigSpaceState,
+    pub config_space: NetConfigSpaceState,
     pub virtio_state: VirtioDeviceState,
-    rx_buffers_state: RxBufferState,
+    pub rx_buffers_state: RxBufferState,
 }
 
 /// Auxiliary structure for creating a device when resuming from a snapshot.
