@@ -168,9 +168,9 @@ impl fmt::Debug for MMIODevManagerConstructorArgs<'_> {
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct ACPIDeviceManagerState {
-    vmgenid: VMGenIDState,
+    pub vmgenid: VMGenIDState,
     #[cfg(target_arch = "x86_64")]
-    vmclock: VmClockState,
+    pub vmclock: VmClockState,
 }
 
 impl<'a> Persist<'a> for ACPIDeviceManager {

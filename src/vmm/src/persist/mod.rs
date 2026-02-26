@@ -43,6 +43,10 @@ use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
 use crate::{EventManager, Vmm, vstate};
 
+pub(crate) mod v1_10;
+pub(crate) mod v1_12;
+pub(crate) mod v1_14;
+
 /// Holds information related to the VM that is not part of VmState.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct VmInfo {
