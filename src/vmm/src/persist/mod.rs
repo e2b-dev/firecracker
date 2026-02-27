@@ -11,6 +11,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -29,7 +30,7 @@ use crate::device_manager::{DevicePersistError, DevicesState};
 use crate::logger::{info, warn};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, SnapshotError, SnapshotHdr};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
@@ -451,10 +452,36 @@ pub enum SnapshotStateFromFileError {
 fn snapshot_state_from_file(
     snapshot_path: &Path,
 ) -> Result<MicrovmState, SnapshotStateFromFileError> {
-    let mut snapshot_reader = File::open(snapshot_path)?;
-    let snapshot = Snapshot::load(&mut snapshot_reader)?;
+    let start = Instant::now();
 
-    Ok(snapshot.data)
+    let data = std::fs::read(snapshot_path)?;
+    let version = SnapshotHdr::load(&mut data.as_slice())?.version;
+
+    let mut snapshot_reader = data.as_slice();
+    let data = match (version.major, version.minor) {
+        (8, 0) => Snapshot::load(&mut snapshot_reader)?.data,
+        (6, 0) => {
+            let v12_state = Snapshot::<v1_12::MicrovmState>::load(&mut snapshot_reader)?;
+            MicrovmState::try_from(v12_state.data).unwrap()
+        }
+        (4, 0) => {
+            let v10_state = Snapshot::<v1_10::MicrovmState>::load(&mut snapshot_reader)?;
+            let v12_state = v1_12::MicrovmState::from(v10_state.data);
+            MicrovmState::try_from(v12_state).unwrap()
+        }
+        _ => {
+            return Err(SnapshotStateFromFileError::Load(
+                SnapshotError::InvalidFormatVersion(version),
+            ));
+        }
+    };
+
+    info!(
+        "Loading snapshot file took {} usec",
+        start.elapsed().as_micros()
+    );
+
+    Ok(data)
 }
 
 /// Error type for [`guest_memory_from_file`].
