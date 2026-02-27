@@ -194,13 +194,13 @@ impl VirtioDeviceState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MmioTransportState {
     // The register where feature bits are stored.
-    features_select: u32,
+    pub features_select: u32,
     // The register where features page is selected.
-    acked_features_select: u32,
-    queue_select: u32,
-    device_status: u32,
-    config_generation: u32,
-    interrupt_status: u32,
+    pub acked_features_select: u32,
+    pub queue_select: u32,
+    pub device_status: u32,
+    pub config_generation: u32,
+    pub interrupt_status: u32,
 }
 
 /// Auxiliary structure for initializing the transport when resuming from a snapshot.

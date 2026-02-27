@@ -20,7 +20,7 @@ use crate::vstate::memory::GuestMemoryMmap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntropyState {
     pub virtio_state: VirtioDeviceState,
-    rate_limiter_state: RateLimiterState,
+    pub rate_limiter_state: RateLimiterState,
 }
 
 #[derive(Debug)]

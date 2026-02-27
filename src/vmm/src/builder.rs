@@ -318,6 +318,7 @@ pub fn build_microvm_for_boot(
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
         device_manager,
+        page_size: vm_resources.machine_config.huge_pages.page_size(),
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -518,6 +519,7 @@ pub fn build_microvm_from_snapshot(
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
         device_manager,
+        page_size: vm_resources.machine_config.huge_pages.page_size(),
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -751,6 +753,7 @@ pub(crate) mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+    use crate::arch::host_page_size;
     use crate::device_manager::tests::default_device_manager;
     use crate::devices::virtio::block::CacheType;
     use crate::devices::virtio::generated::virtio_ids;
@@ -836,6 +839,7 @@ pub(crate) mod tests {
             vcpus_handles: Vec::new(),
             vcpus_exit_evt,
             device_manager: default_device_manager(),
+            page_size: host_page_size(),
         }
     }
 

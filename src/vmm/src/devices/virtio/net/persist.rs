@@ -30,18 +30,29 @@ pub struct NetConfigSpaceState {
     guest_mac: Option<MacAddr>,
 }
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct RxBufferState {
+    // Number of iovecs we have parsed from the guest
+    parsed_descriptor_chains_nr: u16,
+    // Number of used descriptors
+    used_descriptors: u16,
+    // Number of used bytes
+    used_bytes: u32,
+}
+
 /// Information about the network device that are saved
 /// at snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetState {
     pub id: String,
     pub tap_if_name: String,
-    rx_rate_limiter_state: RateLimiterState,
-    tx_rate_limiter_state: RateLimiterState,
+    pub rx_rate_limiter_state: RateLimiterState,
+    pub tx_rate_limiter_state: RateLimiterState,
     /// The associated MMDS network stack.
     pub mmds_ns: Option<MmdsNetworkStackState>,
-    config_space: NetConfigSpaceState,
+    pub config_space: NetConfigSpaceState,
     pub virtio_state: VirtioDeviceState,
+    pub rx_buffers_state: RxBufferState,
 }
 
 /// Auxiliary structure for creating a device when resuming from a snapshot.
@@ -84,6 +95,7 @@ impl Persist<'_> for Net {
                 guest_mac: self.guest_mac,
             },
             virtio_state: VirtioDeviceState::from_device(self),
+            rx_buffers_state: RxBufferState::default(),
         }
     }
 
@@ -127,6 +139,10 @@ impl Persist<'_> for Net {
         )?;
         net.avail_features = state.virtio_state.avail_features;
         net.acked_features = state.virtio_state.acked_features;
+
+        if state.virtio_state.activated {
+            net.queues[RX_INDEX].next_avail -= state.rx_buffers_state.parsed_descriptor_chains_nr;
+        }
 
         Ok(net)
     }

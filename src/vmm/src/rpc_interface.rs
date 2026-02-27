@@ -28,8 +28,9 @@ use crate::vmm_config::balloon::{
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
-use crate::vmm_config::instance_info::InstanceInfo;
+use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
+use crate::vmm_config::meminfo::{MemoryDirty, MemoryMapingsResponse, MemoryResponse};
 use crate::vmm_config::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugSizeUpdate,
 };
@@ -146,6 +147,12 @@ pub enum VmmAction {
     /// Update the microVM configuration (memory & vcpu) using `VmUpdateConfig` as input. This
     /// action can only be called before the microVM has booted.
     UpdateMachineConfiguration(MachineConfigUpdate),
+    /// Get the guest memory mappings to host memory
+    GetMemoryMappings,
+    /// Get guest memory resident and empty pages information
+    GetMemory,
+    /// Get guest memory dirty pages information
+    GetMemoryDirty,
 }
 
 /// Wrapper for all errors associated with VMM actions.
@@ -197,6 +204,8 @@ pub enum VmmActionError {
     OperationNotSupportedPostBoot,
     /// The requested operation is not supported before starting the microVM.
     OperationNotSupportedPreBoot,
+    /// The requested operation is not supported while the microVM is running.
+    OperationNotSupportedWhileRunning,
     /// Start microvm error: {0}
     StartMicrovm(#[from] StartMicrovmError),
     /// Vsock config error: {0}
@@ -228,6 +237,12 @@ pub enum VmmData {
     VirtioMemStatus(VirtioMemStatus),
     /// The status of the virtio-balloon hinting run
     HintingStatus(HintingStatus),
+    /// The guest memory mapping information.
+    MemoryMappings(MemoryMapingsResponse),
+    /// The guest memory resident and empty pages information
+    Memory(MemoryResponse),
+    /// The guest memory dirty pages information
+    MemoryDirty(MemoryDirty),
 }
 
 /// Trait used for deduplicating the MMDS request handling across the two ApiControllers.
@@ -495,7 +510,10 @@ impl<'a> PrebootApiController<'a> {
             | UpdateNetworkInterface(_)
             | StartFreePageHinting(_)
             | GetFreePageHintingStatus
-            | StopFreePageHinting => Err(VmmActionError::OperationNotSupportedPreBoot),
+            | StopFreePageHinting
+            | GetMemoryMappings
+            | GetMemory
+            | GetMemoryDirty => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
         }
@@ -771,6 +789,9 @@ impl RuntimeApiController {
                 .update_memory_hotplug_size(cfg.requested_size_mib)
                 .map(|_| VmmData::Empty)
                 .map_err(VmmActionError::MemoryHotplugUpdate),
+            GetMemoryMappings => self.get_guest_memory_mappings(),
+            GetMemory => self.get_guest_memory_info(),
+            GetMemoryDirty => self.get_dirty_memory_info(),
             // Operations not allowed post-boot.
             ConfigureBootSource(_)
             | ConfigureLogger(_)
@@ -936,6 +957,57 @@ impl RuntimeApiController {
             .map(|()| VmmData::Empty)
             .map_err(NetworkInterfaceError::DeviceUpdate)
             .map_err(VmmActionError::NetworkConfig)
+    }
+
+    /// Get guest memory mappings
+    fn get_guest_memory_mappings(&self) -> Result<VmmData, VmmActionError> {
+        let start_us = get_time_us(ClockType::Monotonic);
+
+        let vmm = self.vmm.lock().expect("Poisoned lock");
+        let page_size = self.vm_resources.machine_config.huge_pages.page_size();
+        let mappings = vmm.guest_memory_mappings(page_size);
+
+        let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
+        info!("'get memory mappings' VMM action took {elapsed_time_us} us.");
+        Ok(VmmData::MemoryMappings(MemoryMapingsResponse { mappings }))
+    }
+
+    /// Get resident and empty pages information for guest memory
+    fn get_guest_memory_info(&self) -> Result<VmmData, VmmActionError> {
+        let start_us = get_time_us(ClockType::Monotonic);
+        let vmm = self.vmm.lock().expect("Poisoned lock");
+
+        // Check if VM is paused
+        if vmm.instance_info.state != VmState::Paused {
+            return Err(VmmActionError::OperationNotSupportedWhileRunning);
+        }
+
+        let page_size = self.vm_resources.machine_config.huge_pages.page_size();
+        let (resident, empty) = vmm.guest_memory_info(page_size)?;
+
+        let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
+        info!("'get memory info' VMM action took {elapsed_time_us} us.");
+
+        Ok(VmmData::Memory(MemoryResponse { resident, empty }))
+    }
+
+    /// Get dirty pages information for guest memory
+    fn get_dirty_memory_info(&self) -> Result<VmmData, VmmActionError> {
+        let start_us = get_time_us(ClockType::Monotonic);
+        let vmm = self.vmm.lock().expect("Poisoned lock");
+
+        // Check if VM is paused
+        if vmm.instance_info.state != VmState::Paused {
+            return Err(VmmActionError::OperationNotSupportedWhileRunning);
+        }
+
+        let page_size = self.vm_resources.machine_config.huge_pages.page_size();
+        let bitmap = vmm.get_dirty_memory(page_size)?;
+
+        let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
+        info!("'get dirty memory' VMM action took {elapsed_time_us} us.");
+
+        Ok(VmmData::MemoryDirty(MemoryDirty { bitmap }))
     }
 }
 
@@ -1243,7 +1315,7 @@ mod tests {
             CreateSnapshotParams {
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: PathBuf::new(),
-                mem_file_path: PathBuf::new(),
+                mem_file_path: Some(PathBuf::new()),
             },
         )));
         #[cfg(target_arch = "x86_64")]

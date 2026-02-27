@@ -224,13 +224,18 @@ pub struct VmState {
     pub memory: GuestMemoryState,
     /// resource allocator
     pub resource_allocator: ResourceAllocator,
-    pitstate: kvm_pit_state2,
-    clock: kvm_clock_data,
+    /// KVM interrupt timer
+    pub pitstate: kvm_pit_state2,
+    /// KVM clock data
+    pub clock: kvm_clock_data,
     // TODO: rename this field to adopt inclusive language once Linux updates it, too.
-    pic_master: kvm_irqchip,
+    /// Master PIC controller
+    pub pic_master: kvm_irqchip,
     // TODO: rename this field to adopt inclusive language once Linux updates it, too.
-    pic_slave: kvm_irqchip,
-    ioapic: kvm_irqchip,
+    /// Slave PIC controller
+    pub pic_slave: kvm_irqchip,
+    /// IOAPIC
+    pub ioapic: kvm_irqchip,
 }
 
 impl fmt::Debug for VmState {

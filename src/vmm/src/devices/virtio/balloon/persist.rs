@@ -31,22 +31,22 @@ pub struct BalloonConfigSpaceState {
 /// at snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BalloonStatsState {
-    swap_in: Option<u64>,
-    swap_out: Option<u64>,
-    major_faults: Option<u64>,
-    minor_faults: Option<u64>,
-    free_memory: Option<u64>,
-    total_memory: Option<u64>,
-    available_memory: Option<u64>,
-    disk_caches: Option<u64>,
-    hugetlb_allocations: Option<u64>,
-    hugetlb_failures: Option<u64>,
-    oom_kill: Option<u64>,
-    alloc_stall: Option<u64>,
-    async_scan: Option<u64>,
-    direct_scan: Option<u64>,
-    async_reclaim: Option<u64>,
-    direct_reclaim: Option<u64>,
+    pub swap_in: Option<u64>,
+    pub swap_out: Option<u64>,
+    pub major_faults: Option<u64>,
+    pub minor_faults: Option<u64>,
+    pub free_memory: Option<u64>,
+    pub total_memory: Option<u64>,
+    pub available_memory: Option<u64>,
+    pub disk_caches: Option<u64>,
+    pub hugetlb_allocations: Option<u64>,
+    pub hugetlb_failures: Option<u64>,
+    pub oom_kill: Option<u64>,
+    pub alloc_stall: Option<u64>,
+    pub async_scan: Option<u64>,
+    pub direct_scan: Option<u64>,
+    pub async_reclaim: Option<u64>,
+    pub direct_reclaim: Option<u64>,
 }
 
 impl BalloonStatsState {
@@ -101,11 +101,11 @@ impl BalloonStatsState {
 /// at snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BalloonState {
-    stats_polling_interval_s: u16,
-    stats_desc_index: Option<u16>,
-    latest_stats: BalloonStatsState,
-    config_space: BalloonConfigSpaceState,
-    hinting_state: HintingState,
+    pub stats_polling_interval_s: u16,
+    pub stats_desc_index: Option<u16>,
+    pub latest_stats: BalloonStatsState,
+    pub config_space: BalloonConfigSpaceState,
+    pub hinting_state: HintingState,
     pub virtio_state: VirtioDeviceState,
 }
 

@@ -81,24 +81,19 @@ fn serialize<S: Serialize, W: Write>(data: &S, write: &mut W) -> Result<(), Snap
 
 /// Firecracker snapshot header
 #[derive(Debug, Serialize, Deserialize)]
-struct SnapshotHdr {
+pub struct SnapshotHdr {
     /// magic value
-    magic: u64,
+    pub magic: u64,
     /// Snapshot data version
-    version: Version,
+    pub version: Version,
 }
 
 impl SnapshotHdr {
-    fn load(buf: &mut &[u8]) -> Result<Self, SnapshotError> {
+    pub(crate) fn load(buf: &mut &[u8]) -> Result<Self, SnapshotError> {
         let (hdr, bytes_read) = bincode::serde::decode_from_slice::<Self, _>(buf, BINCODE_CONFIG)?;
 
         if hdr.magic != SNAPSHOT_MAGIC_ID {
             return Err(SnapshotError::InvalidMagic(hdr.magic));
-        }
-
-        if hdr.version.major != SNAPSHOT_VERSION.major || hdr.version.minor > SNAPSHOT_VERSION.minor
-        {
-            return Err(SnapshotError::InvalidFormatVersion(hdr.version));
         }
 
         *buf = &buf[bytes_read..];

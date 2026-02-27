@@ -11,10 +11,11 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use userfaultfd::{FeatureFlags, RegisterMode, Uffd, UffdBuilder};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
@@ -29,7 +30,7 @@ use crate::device_manager::{DevicePersistError, DevicesState};
 use crate::logger::{info, warn};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, SnapshotError, SnapshotHdr};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
@@ -42,6 +43,10 @@ use crate::vstate::memory::{
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
 use crate::{EventManager, Vmm, vstate};
+
+pub(crate) mod v1_10;
+pub(crate) mod v1_12;
+pub(crate) mod v1_14;
 
 /// Holds information related to the VM that is not part of VmState.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -161,8 +166,10 @@ pub fn create_snapshot(
 
     snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
 
-    vmm.vm
-        .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    if let Some(mem_file_path) = params.mem_file_path.as_ref() {
+        vmm.vm
+            .snapshot_memory_to_file(mem_file_path, params.snapshot_type, vmm.page_size)?;
+    }
 
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is that we don't mark pages as dirty during runtime
@@ -445,10 +452,36 @@ pub enum SnapshotStateFromFileError {
 fn snapshot_state_from_file(
     snapshot_path: &Path,
 ) -> Result<MicrovmState, SnapshotStateFromFileError> {
-    let mut snapshot_reader = File::open(snapshot_path)?;
-    let snapshot = Snapshot::load(&mut snapshot_reader)?;
+    let start = Instant::now();
 
-    Ok(snapshot.data)
+    let data = std::fs::read(snapshot_path)?;
+    let version = SnapshotHdr::load(&mut data.as_slice())?.version;
+
+    let mut snapshot_reader = data.as_slice();
+    let data = match (version.major, version.minor) {
+        (8, 0) => Snapshot::load(&mut snapshot_reader)?.data,
+        (6, 0) => {
+            let v12_state = Snapshot::<v1_12::MicrovmState>::load(&mut snapshot_reader)?;
+            MicrovmState::try_from(v12_state.data).unwrap()
+        }
+        (4, 0) => {
+            let v10_state = Snapshot::<v1_10::MicrovmState>::load(&mut snapshot_reader)?;
+            let v12_state = v1_12::MicrovmState::from(v10_state.data);
+            MicrovmState::try_from(v12_state).unwrap()
+        }
+        _ => {
+            return Err(SnapshotStateFromFileError::Load(
+                SnapshotError::InvalidFormatVersion(version),
+            ));
+        }
+    };
+
+    info!(
+        "Loading snapshot file took {} usec",
+        start.elapsed().as_micros()
+    );
+
+    Ok(data)
 }
 
 /// Error type for [`guest_memory_from_file`].
@@ -481,6 +514,8 @@ pub enum GuestMemoryFromUffdError {
     Create(userfaultfd::Error),
     /// Failed to register memory address range with the userfaultfd object: {0}
     Register(userfaultfd::Error),
+    /// Failed to enable write protection on memory address range with the userfaultfd object: {0}
+    WriteProtect(userfaultfd::Error),
     /// Failed to connect to UDS Unix stream: {0}
     Connect(#[from] std::io::Error),
     /// Failed to sends file descriptor: {0}
@@ -502,7 +537,9 @@ fn guest_memory_from_uffd(
     // because the only place the kernel checks this is in a hook from madvise, e.g. it doesn't
     // actively change the behavior of UFFD, only passively. Without balloon devices
     // we never call madvise anyway, so no need to put this into a conditional.
-    uffd_builder.require_features(FeatureFlags::EVENT_REMOVE);
+    uffd_builder.require_features(
+        FeatureFlags::EVENT_REMOVE | FeatureFlags::MISSING_HUGETLBFS | FeatureFlags::WP_ASYNC,
+    );
 
     let uffd = uffd_builder
         .close_on_exec(true)
@@ -512,8 +549,22 @@ fn guest_memory_from_uffd(
         .map_err(GuestMemoryFromUffdError::Create)?;
 
     for mem_region in guest_memory.iter() {
-        uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
-            .map_err(GuestMemoryFromUffdError::Register)?;
+        uffd.register_with_mode(
+            mem_region.as_ptr().cast(),
+            mem_region.size() as _,
+            RegisterMode::MISSING | RegisterMode::WRITE_PROTECT,
+        )
+        .map_err(GuestMemoryFromUffdError::Register)?;
+
+        // If memory is backed by huge pages, we can immediately write protect it.
+        // Otherwise (memory is backed by anonymous memory), write protecting here
+        // won't have any effect, as the write-protection bit for a bitwill be
+        // wiped when the first page fault occurs. These cases need to be handled
+        // directly from the UFFD handler.
+        if huge_pages.is_hugetlbfs() {
+            uffd.write_protect(mem_region.as_ptr().cast(), mem_region.size() as _)
+                .map_err(GuestMemoryFromUffdError::WriteProtect)?;
+        }
     }
 
     send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
