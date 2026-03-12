@@ -492,9 +492,12 @@ fn guest_memory_from_uffd(
     // because the only place the kernel checks this is in a hook from madvise, e.g. it doesn't
     // actively change the behavior of UFFD, only passively. Without balloon devices
     // we never call madvise anyway, so no need to put this into a conditional.
-    uffd_builder.require_features(
-        FeatureFlags::EVENT_REMOVE | FeatureFlags::MISSING_HUGETLBFS | FeatureFlags::WP_ASYNC,
-    );
+    #[cfg(target_arch = "x86_64")]
+    let features =
+        FeatureFlags::EVENT_REMOVE | FeatureFlags::MISSING_HUGETLBFS | FeatureFlags::WP_ASYNC;
+    #[cfg(not(target_arch = "x86_64"))]
+    let features = FeatureFlags::EVENT_REMOVE | FeatureFlags::MISSING_HUGETLBFS;
+    uffd_builder.require_features(features);
 
     let uffd = uffd_builder
         .close_on_exec(true)
@@ -504,10 +507,14 @@ fn guest_memory_from_uffd(
         .map_err(GuestMemoryFromUffdError::Create)?;
 
     for mem_region in guest_memory.iter() {
+        #[cfg(target_arch = "x86_64")]
+        let mode = RegisterMode::MISSING | RegisterMode::WRITE_PROTECT;
+        #[cfg(not(target_arch = "x86_64"))]
+        let mode = RegisterMode::MISSING;
         uffd.register_with_mode(
             mem_region.as_ptr().cast(),
             mem_region.size() as _,
-            RegisterMode::MISSING | RegisterMode::WRITE_PROTECT,
+            mode,
         )
         .map_err(GuestMemoryFromUffdError::Register)?;
 
@@ -516,6 +523,7 @@ fn guest_memory_from_uffd(
         // won't have any effect, as the write-protection bit for a page will be
         // wiped when the first page fault occurs. These cases need to be handled
         // directly from the UFFD handler.
+        #[cfg(target_arch = "x86_64")]
         if huge_pages.is_hugetlbfs() {
             uffd.write_protect(mem_region.as_ptr().cast(), mem_region.size() as _)
                 .map_err(GuestMemoryFromUffdError::WriteProtect)?;
