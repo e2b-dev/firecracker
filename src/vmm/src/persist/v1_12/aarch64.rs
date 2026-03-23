@@ -7,12 +7,11 @@ use serde::{Deserialize, Serialize};
 use super::{GuestMemoryState, MMIODeviceInfo};
 
 // Types that are canonical in v1_14 and unchanged through all versions
-pub use crate::v1_14::{
+pub use crate::persist::v1_14::{
     // Legacy device type enum
     DeviceType,
     // GIC helper types (GicState itself changed — its_state added — so redefined in v1_14)
     GicRegState,
-    VgicSysRegsState,
     GicVcpuState,
     // Register vector with custom serde
     Aarch64RegisterVec,

@@ -57,9 +57,13 @@ pub fn restore_state(
         icc_regs::set_icc_regs(gic_device, *mpidr, &vcpu_state.icc)?;
     }
 
-    // Safe to unwrap here, as we know we support an ITS device, so `its_state.is_some()` is always
-    // `true`.
-    state.its_state.as_ref().unwrap().restore(its_device)
+    // `its_state` is `None` when loading a snapshot created by an older Firecracker version that
+    // did not save ITS state. In that case, skip ITS restore and leave the ITS in its reset
+    // state; the guest kernel will re-initialize it.
+    if let Some(its_state) = &state.its_state {
+        its_state.restore(its_device)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

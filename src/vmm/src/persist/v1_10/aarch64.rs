@@ -3,20 +3,14 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{KvmCapability, MMIODeviceInfo};
+use crate::cpu_config::templates::KvmCapability;
+use super::MMIODeviceInfo;
 
 // Types that are identical across all versions — canonical definitions in v1_14.
-pub use crate::v1_14::{
-    StaticCpuTemplate,
-    DeviceType,
-    GicRegState,
-    VgicSysRegsState,
-    GicVcpuState,
-    Aarch64RegisterVec,
-};
+pub use crate::persist::v1_14::DeviceType;
 
 // Types that are identical in v1.10 and v1.12 — canonical definitions in v1_12.
-pub use crate::v1_12::{
+pub use crate::persist::v1_12::{
     // aarch64 GicState is identical in v1.10 and v1.12 (gains its_state in v1.14)
     GicState,
     // aarch64 VcpuState is identical in v1.10 and v1.12 (gains pvtime_ipa in v1.14)

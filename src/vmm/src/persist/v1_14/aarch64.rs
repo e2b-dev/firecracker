@@ -1,18 +1,25 @@
 // Copyright 2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use kvm_bindings::{kvm_mp_state, kvm_vcpu_init};
 use serde::{Deserialize, Serialize};
 
-use crate::convert::{ConvertError, irq_to_gsi};
-use crate::v1_12;
-
-use super::{
-    ACPIDeviceManagerState, GuestMemoryState, MMIODeviceInfo, ResourceAllocator, VMGenIDState,
-};
+use super::{ACPIDeviceManagerState, ConvertError, GuestMemoryState, MMIODeviceInfo,
+            ResourceAllocator, irq_to_gsi};
+use crate::devices::acpi::vmgenid::VMGenIDState;
+use crate::persist::v1_12;
 
 // ───────────────────────────────────────────────────────────────────
-// StaticCpuTemplate — canonical definition (identical in v1.10, v1.12, v1.14)
+// Re-export runtime types — v1.14 snapshot format matches the runtime format.
+// These are used by v1.12 (and v1.10 via v1.12) as canonical type definitions.
+// ───────────────────────────────────────────────────────────────────
+
+pub use crate::arch::aarch64::gic::{GicRegState, GicState, GicVcpuState};
+pub use crate::arch::aarch64::regs::Aarch64RegisterVec;
+pub use crate::arch::aarch64::vcpu::VcpuState;
+pub use crate::arch::aarch64::vm::VmState;
+
+// ───────────────────────────────────────────────────────────────────
+// StaticCpuTemplate — aarch64-specific snapshot enum (same in v1.10, v1.12, v1.14)
 // ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,7 +30,7 @@ pub enum StaticCpuTemplate {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// aarch64 legacy device types — canonical definitions
+// DeviceType — aarch64 legacy device type enum (snapshot format)
 // ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,93 +40,33 @@ pub enum DeviceType {
     Rtc,
 }
 
-// ───────────────────────────────────────────────────────────────────
-// GIC helper types — canonical definitions (unchanged since v1.10)
-// ───────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "T: Serialize", deserialize = "T: for<'a> Deserialize<'a>"))]
-pub struct GicRegState<T: Serialize + for<'a> Deserialize<'a>> {
-    pub chunks: Vec<T>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VgicSysRegsState {
-    pub main_icc_regs: Vec<GicRegState<u64>>,
-    pub ap_icc_regs: Vec<Option<GicRegState<u64>>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GicVcpuState {
-    pub rdist: Vec<GicRegState<u32>>,
-    pub icc: VgicSysRegsState,
-}
-
-// ───────────────────────────────────────────────────────────────────
-// aarch64 register vector — canonical definition (unchanged since v1.10)
-// ───────────────────────────────────────────────────────────────────
-
-/// aarch64 register vector with custom serde: serialized as (Vec<u64>, Vec<u8>)
-#[derive(Debug, Clone)]
-pub struct Aarch64RegisterVec {
-    pub ids: Vec<u64>,
-    pub data: Vec<u8>,
-}
-
-impl Serialize for Aarch64RegisterVec {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        (&self.ids, &self.data).serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for Aarch64RegisterVec {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let (ids, data) = <(Vec<u64>, Vec<u8>)>::deserialize(deserializer)?;
-        Ok(Aarch64RegisterVec { ids, data })
+impl From<DeviceType> for crate::arch::DeviceType {
+    fn from(dt: DeviceType) -> Self {
+        match dt {
+            DeviceType::Virtio(n) => crate::arch::DeviceType::Virtio(n),
+            DeviceType::Serial => crate::arch::DeviceType::Serial,
+            DeviceType::Rtc => crate::arch::DeviceType::Rtc,
+        }
     }
 }
 
 // ───────────────────────────────────────────────────────────────────
-// aarch64 ConnectedLegacyState (uses updated MMIODeviceInfo with gsi)
+// ConnectedLegacyState — convert v1.12 snapshot type to runtime type
 // ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConnectedLegacyState {
-    pub type_: DeviceType,
-    pub device_info: MMIODeviceInfo,
-}
-
-impl From<v1_12::ConnectedLegacyState> for ConnectedLegacyState {
+impl From<v1_12::ConnectedLegacyState> for crate::device_manager::persist::ConnectedLegacyState {
     fn from(s: v1_12::ConnectedLegacyState) -> Self {
-        ConnectedLegacyState {
-            type_: s.type_,
+        crate::device_manager::persist::ConnectedLegacyState {
+            type_: crate::arch::DeviceType::from(s.type_),
             device_info: MMIODeviceInfo::from(s.device_info),
         }
     }
 }
 
 // ───────────────────────────────────────────────────────────────────
-// aarch64 GIC state (v1.14: adds its_state)
-// GicRegState, VgicSysRegsState, GicVcpuState are defined above
+// GIC state (aarch64, v1.14: adds its_state)
+// GicState is the runtime type (re-exported above); conversion from v1.12 is here.
 // ───────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ItsRegisterState {
-    pub iidr: u64,
-    pub cbaser: u64,
-    pub creadr: u64,
-    pub cwriter: u64,
-    pub baser: [u64; 8],
-    pub ctlr: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GicState {
-    pub dist: Vec<GicRegState<u32>>,
-    pub gic_vcpu_states: Vec<GicVcpuState>,
-    /// ITS state (GICv3 only). None for GICv2 or when converted from v1.12.
-    pub its_state: Option<ItsRegisterState>,
-}
 
 impl GicState {
     pub(crate) fn from(old_state: v1_12::GicState) -> GicState {
@@ -133,16 +80,8 @@ impl GicState {
 
 // ───────────────────────────────────────────────────────────────────
 // vCPU state (aarch64, v1.14: gains pvtime_ipa)
+// VcpuState is the runtime type (re-exported above); conversion from v1.12 is here.
 // ───────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VcpuState {
-    pub mp_state: kvm_mp_state,
-    pub regs: Aarch64RegisterVec,
-    pub mpidr: u64,
-    pub kvi: kvm_vcpu_init,
-    pub pvtime_ipa: Option<u64>,
-}
 
 impl VcpuState {
     pub(crate) fn from(old_state: v1_12::VcpuState) -> VcpuState {
@@ -157,7 +96,7 @@ impl VcpuState {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// ACPI device state impl (aarch64: no vmclock)
+// ACPI device state (aarch64: no vmclock)
 // ───────────────────────────────────────────────────────────────────
 
 impl ACPIDeviceManagerState {
@@ -178,14 +117,8 @@ impl ACPIDeviceManagerState {
 
 // ───────────────────────────────────────────────────────────────────
 // VM state (aarch64, v1.14: adds resource_allocator)
+// VmState is the runtime type (re-exported above); conversion from v1.12 is here.
 // ───────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VmState {
-    pub memory: GuestMemoryState,
-    pub gic: GicState,
-    pub resource_allocator: ResourceAllocator,
-}
 
 impl VmState {
     pub(crate) fn from(

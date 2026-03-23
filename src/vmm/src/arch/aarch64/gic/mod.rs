@@ -8,7 +8,8 @@ mod regs;
 use gicv2::GICv2;
 use gicv3::GICv3;
 use kvm_ioctls::{DeviceFd, VmFd};
-pub use regs::GicState;
+pub use regs::{GicRegState, GicState, GicVcpuState, VgicSysRegsState};
+pub use gicv3::regs::its_regs::ItsRegisterState;
 
 use super::layout;
 
