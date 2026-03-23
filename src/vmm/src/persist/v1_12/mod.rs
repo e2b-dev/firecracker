@@ -19,6 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::v1_10;
+#[cfg(target_arch = "x86_64")]
 use crate::arch::VcpuState;
 use crate::devices::acpi::vmgenid::VMGenIDState;
 use crate::devices::virtio::balloon::persist::BalloonConfigSpaceState;

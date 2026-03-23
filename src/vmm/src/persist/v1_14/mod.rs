@@ -34,14 +34,18 @@ pub use aarch64::*;
 use crate::arch::{
     FIRST_ADDR_PAST_64BITS_MMIO, GSI_LEGACY_END, GSI_LEGACY_START, GSI_MSI_END, GSI_MSI_START,
     MEM_32BIT_DEVICES_SIZE, MEM_32BIT_DEVICES_START, MEM_64BIT_DEVICES_SIZE,
-    MEM_64BIT_DEVICES_START, PAST_64BITS_MMIO_SIZE, SYSTEM_MEM_SIZE, SYSTEM_MEM_START, VmState,
+    MEM_64BIT_DEVICES_START, PAST_64BITS_MMIO_SIZE, SYSTEM_MEM_SIZE, SYSTEM_MEM_START,
 };
+#[cfg(target_arch = "x86_64")]
+use crate::arch::VmState;
 use crate::device_manager::DevicesState;
 use crate::device_manager::mmio::MMIODeviceInfo;
 use crate::device_manager::pci_mngr::PciDevicesState;
 use crate::device_manager::persist::{
     ACPIDeviceManagerState, DeviceStates, MmdsState, VirtioDeviceState as ConnectedDeviceState,
 };
+#[cfg(target_arch = "aarch64")]
+use crate::device_manager::persist::ConnectedLegacyState;
 use crate::devices::acpi::vmgenid::VMGENID_MEM_SIZE;
 use crate::devices::virtio::balloon::device::HintingState;
 use crate::devices::virtio::balloon::persist::{BalloonState, BalloonStatsState};

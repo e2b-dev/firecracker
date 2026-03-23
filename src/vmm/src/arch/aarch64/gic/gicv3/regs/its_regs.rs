@@ -80,7 +80,7 @@ pub fn its_restore_tables(its_fd: &DeviceFd) -> Result<(), GicError> {
 }
 
 /// ITS registers that we save/restore during snapshot
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ItsRegisterState {
     iidr: u64,
     cbaser: u64,
