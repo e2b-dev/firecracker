@@ -5,8 +5,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{
-    KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
-    KVM_PIT_SPEAKER_DUMMY, MsrList, kvm_clock_data, kvm_irqchip, kvm_pit_config, kvm_pit_state2,
+    KVM_CLOCK_REALTIME, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_PIT_SPEAKER_DUMMY, MsrList, kvm_clock_data, kvm_irqchip, kvm_pit_config, kvm_pit_state2
 };
 use kvm_ioctls::Cap;
 use serde::{Deserialize, Serialize};
@@ -131,8 +130,13 @@ impl ArchVm {
         self.fd()
             .set_pit2(&state.pitstate)
             .map_err(ArchVmError::SetPit2)?;
+
+        // Do not pass KVM_CLOCK_REALTIME to the ioctl(). This causes the kernel to
+        // adjust the MONOTONIC clock which might cause issues for the guest userspace.
+        let mut clock = state.clock;
+        clock.flags &= !KVM_CLOCK_REALTIME;
         self.fd()
-            .set_clock(&state.clock)
+            .set_clock(&clock)
             .map_err(ArchVmError::SetClock)?;
         self.fd()
             .set_irqchip(&state.pic_master)
