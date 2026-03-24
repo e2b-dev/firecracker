@@ -618,6 +618,54 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /memory/mappings:
+    get:
+      summary: Gets the memory mappings with skippable pages bitmap.
+      operationId: getMemoryMappings
+      responses:
+        200:
+          description: OK
+          schema:
+            $ref: "#/definitions/MemoryMappingsResponse"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
+  /memory:
+    get:
+      summary: Gets the memory info (resident and empty pages).
+      description: Returns an object with resident and empty bitmaps. The resident bitmap marks all pages that are resident. The empty bitmap marks zero pages (subset of resident pages). This is checked at the pageSize of each region. All regions must have the same page size.
+      operationId: getMemory
+      responses:
+        200:
+          description: OK
+          schema:
+            $ref: "#/definitions/MemoryResponse"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
+  /memory/dirty:
+    get:
+      summary: Gets the dirty pages bitmap for guest memory.
+      description: Returns a bitmap of dirty pages (pages written to since write-protection was enabled). The bitmap is encoded as a vector of u64 values where each bit represents one guest page. Pages are ordered following the order of memory regions as reported by /memory/mappings. The microVM must be paused before calling this endpoint.
+      operationId: getMemoryDirty
+      responses:
+        200:
+          description: OK
+          schema:
+            $ref: "#/definitions/MemoryDirty"
+        400:
+          description: The microVM is not paused.
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /version:
     get:
       summary: Gets the Firecracker version.
@@ -997,6 +1045,72 @@ definitions:
         description: MicroVM hypervisor build version.
         type: string
 
+  GuestMemoryRegionMapping:
+    type: object
+    description: Describes the region of guest memory that can be used for creating the memfile.
+    required:
+      - base_host_virt_addr
+      - size
+      - offset
+      - page_size
+    properties:
+      base_host_virt_addr:
+        type: integer
+      size:
+        description: The size of the region in bytes.
+        type: integer
+      offset:
+        description: The offset of the region in bytes.
+        type: integer
+      page_size:
+        description: The page size in bytes.
+        type: integer
+
+  MemoryMappingsResponse:
+    type: object
+    description: Response containing memory region mappings.
+    required:
+      - mappings
+    properties:
+      mappings:
+        type: array
+        description: The memory region mappings.
+        items:
+          $ref: "#/definitions/GuestMemoryRegionMapping"
+
+  MemoryResponse:
+    type: object
+    description: Response containing the memory info (resident and empty pages).
+    required:
+      - resident
+      - empty
+    properties:
+      resident:
+        type: array
+        description: The resident bitmap as a vector of u64 values. Each bit represents if the page is resident.
+        items:
+          type: integer
+          format: uint64
+      empty:
+        type: array
+        description: The empty bitmap as a vector of u64 values. Each bit represents if the page is zero (empty). This is a subset of the resident pages.
+        items:
+          type: integer
+          format: uint64
+
+  MemoryDirty:
+    type: object
+    description: Response containing the dirty pages bitmap for guest memory. The bitmap is structured as a vector of u64, so its length is total_number_of_pages.div_ceil(64). Pages are ordered in the order of pages as reported by /memory/mappings.
+    required:
+      - bitmap
+    properties:
+      bitmap:
+        type: array
+        description: Bitmap for dirty pages. Each bit represents whether a page has been written since write-protection was enabled.
+        items:
+          type: integer
+          format: uint64
+
   Logger:
     type: object
     description:
@@ -1198,12 +1312,14 @@ definitions:
   SnapshotCreateParams:
     type: object
     required:
-      - mem_file_path
       - snapshot_path
     properties:
       mem_file_path:
         type: string
-        description: Path to the file that will contain the guest memory.
+        description:
+          Path to the file that will contain the guest memory. This field is
+          optional. If not specified, the guest memory will not be saved to a
+          file.
       snapshot_path:
         type: string
         description: Path to the file that will contain the microVM state.
