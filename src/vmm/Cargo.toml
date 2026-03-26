@@ -47,7 +47,11 @@ serde_json = "1.0.145"
 slab = "0.4.11"
 thiserror = "2.0.17"
 timerfd = "1.5.0"
-userfaultfd = "0.9.0"
+userfaultfd = { git = "https://github.com/e2b-dev/userfaultfd-rs", branch = "feat_write_protection", features = [
+  "linux5_7",
+  "linux5_13",
+  "linux6_7"
+] }
 utils = { path = "../utils" }
 uuid = "1.18.1"
 vhost = { version = "0.15.0", features = ["vhost-user-frontend"] }
