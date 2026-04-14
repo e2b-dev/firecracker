@@ -6,11 +6,13 @@
 
 mod api_server;
 mod api_types;
+mod envd;
 mod guest_mem;
 mod uffd;
 mod vm_state;
 mod workload;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -72,6 +74,18 @@ struct Args {
     /// Initial workload simulation config (mock-specific)
     #[arg(long = "workload-config")]
     workload_config: Option<PathBuf>,
+
+    /// Port for the mock envd HTTP server (default: 49983, matching e2b envd)
+    #[arg(long = "envd-port", default_value = "49983")]
+    envd_port: u16,
+
+    /// Bind address for the mock envd HTTP server
+    #[arg(long = "envd-addr", default_value = "0.0.0.0")]
+    envd_addr: String,
+
+    /// Disable the mock envd server
+    #[arg(long = "no-envd")]
+    no_envd: bool,
 }
 
 #[tokio::main]
@@ -116,6 +130,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(ref p) = args.metadata {
         state.lock().await.mmds_data = serde_json::from_str(&std::fs::read_to_string(p)?)?;
+    }
+
+    // Start envd mock server on TCP alongside the Firecracker API.
+    // The orchestrator expects envd at http://<sandbox_ip>:49983.
+    let envd_state = Arc::new(Mutex::new(envd::EnvdState::new()));
+    if !args.no_envd {
+        let addr: SocketAddr = format!("{}:{}", args.envd_addr, args.envd_port)
+            .parse()
+            .expect("invalid envd bind address");
+        let es = envd_state.clone();
+        let vs = state.clone();
+        tokio::spawn(async move {
+            envd::serve(addr, es, vs).await;
+        });
     }
 
     if let Some(ref p) = args.config_file {
