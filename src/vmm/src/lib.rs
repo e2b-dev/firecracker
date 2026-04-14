@@ -144,13 +144,15 @@ use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEV_ID, VirtioMem, VirtioMemError, VirtioMemStatus};
 use crate::devices::virtio::net::Net;
 use crate::logger::{METRICS, MetricsError, error, info, warn};
-use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
+use crate::persist::{GuestRegionUffdMapping, MicrovmState, MicrovmStateError, VmInfo};
 use crate::rate_limiter::BucketUpdate;
+use crate::utils::usize_to_u64;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use crate::vstate::vcpu::VcpuState;
 pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
 pub use crate::vstate::vm::Vm;
+use crate::vstate::vm::mincore_bitmap;
 
 /// Shorthand type for the EventManager flavour used by Firecracker.
 pub type EventManager = BaseEventManager<Arc<Mutex<dyn MutEventSubscriber>>>;
@@ -254,6 +256,8 @@ pub enum VmmError {
     Block(#[from] BlockError),
     /// Balloon: {0}
     Balloon(#[from] BalloonError),
+    /// Pagemap error: {0}
+    Pagemap(#[from] utils::pagemap::PagemapError),
     /// Failed to create memory hotplug device: {0}
     VirtioMem(#[from] VirtioMemError),
 }
@@ -313,6 +317,8 @@ pub struct Vmm {
     vcpus_exit_evt: EventFd,
     // Device manager
     device_manager: DeviceManager,
+    /// Page size used for backing guest memory
+    pub page_size: usize,
 }
 
 impl Vmm {
@@ -689,6 +695,130 @@ impl Vmm {
     #[cfg(feature = "gdb")]
     pub fn vm(&self) -> &Vm {
         &self.vm
+    }
+
+    /// Get the list of mappings for guest memory
+    pub fn guest_memory_mappings(&self, page_size: usize) -> Vec<GuestRegionUffdMapping> {
+        let mut mappings = vec![];
+        let mut offset = 0;
+
+        for region in self
+            .vm
+            .guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+        {
+            let size = region.slice.len();
+            #[allow(deprecated)]
+            mappings.push(GuestRegionUffdMapping {
+                base_host_virt_addr: region.slice.ptr_guard_mut().as_ptr() as u64,
+                size,
+                offset,
+                page_size,
+                page_size_kib: page_size,
+            });
+
+            offset += usize_to_u64(size);
+        }
+
+        mappings
+    }
+
+    /// Get info regarding resident and empty pages for guest memory
+    pub fn guest_memory_info(&self, page_size: usize) -> Result<(Vec<u64>, Vec<u64>), VmmError> {
+        let mut resident = vec![];
+        let mut empty = vec![];
+        let zero_page = vec![0u8; page_size];
+
+        for mem_slot in self
+            .vm
+            .guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+        {
+            debug_assert!(mem_slot.slice.len().is_multiple_of(page_size));
+            debug_assert!(
+                (mem_slot.slice.ptr_guard_mut().as_ptr() as usize).is_multiple_of(page_size)
+            );
+
+            let len = mem_slot.slice.len();
+            let nr_pages = len / page_size;
+            let addr = mem_slot.slice.ptr_guard_mut().as_ptr();
+            let mut curr_empty = vec![0u64; nr_pages.div_ceil(64)];
+            let curr_resident = mincore_bitmap(addr, mem_slot.slice.len(), page_size)?;
+
+            for page_idx in 0..nr_pages {
+                if (curr_resident[page_idx / 64] & (1u64 << (page_idx % 64))) == 0 {
+                    continue;
+                }
+
+                // SAFETY: `addr` points to a memory region that is `nr_pages * page_size` long.
+                let curr_addr = unsafe { addr.add(page_idx * page_size) };
+
+                // SAFETY: both addresses are valid and they point to a memory region
+                // that is (at least) `page_size` long
+                let ret = unsafe {
+                    libc::memcmp(
+                        curr_addr.cast::<libc::c_void>(),
+                        zero_page.as_ptr().cast::<libc::c_void>(),
+                        page_size,
+                    )
+                };
+
+                if ret == 0 {
+                    curr_empty[page_idx / 64] |= 1u64 << (page_idx % 64);
+                }
+            }
+
+            resident.extend_from_slice(&curr_resident);
+            empty.extend_from_slice(&curr_empty);
+        }
+
+        Ok((resident, empty))
+    }
+
+    /// Get dirty pages bitmap for guest memory
+    pub fn get_dirty_memory(&self, page_size: usize) -> Result<Vec<u64>, VmmError> {
+        let pagemap = utils::pagemap::PagemapReader::new(page_size)?;
+        let mut dirty_bitmap = vec![];
+
+        for mem_slot in self
+            .vm
+            .guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+        {
+            let base_addr = mem_slot.slice.ptr_guard_mut().as_ptr() as usize;
+            let len = mem_slot.slice.len();
+            let nr_pages = len / page_size;
+
+            // Use mincore_bitmap to get resident pages at guest page size granularity
+            let resident_bitmap = vstate::vm::mincore_bitmap(base_addr as *mut u8, len, page_size)?;
+
+            // TODO: if we don't support UFFD/async WP, we can completely skip this bit, as the
+            // UFFD handler already tracks dirty pages through the WriteProtected events. For the
+            // time being, we always do.
+            //
+            // Build dirty bitmap: check pagemap only for pages that mincore reports resident.
+            // This way we reduce the amount of times we read out of /proc/<pid>/pagemap.
+            let mut slot_bitmap = vec![0u64; nr_pages.div_ceil(64)];
+            for page_idx in 0..nr_pages {
+                // Check if page is resident in the bitmap.
+                // TODO: These operations (add to bitmap, check for presence, etc.) merit their own
+                // implementation, somewhere within a bitmap type).
+                let is_resident = (resident_bitmap[page_idx / 64] & (1u64 << (page_idx % 64))) != 0;
+                if is_resident {
+                    let virt_addr = base_addr + (page_idx * page_size);
+                    if pagemap.is_page_dirty(virt_addr)? {
+                        slot_bitmap[page_idx / 64] |= 1u64 << (page_idx % 64);
+                    }
+                }
+            }
+
+            dirty_bitmap.extend_from_slice(&slot_bitmap);
+        }
+
+        Ok(dirty_bitmap)
     }
 }
 

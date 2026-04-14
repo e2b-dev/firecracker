@@ -6,6 +6,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.4]
+
+### Fixed
+
+- [#5762](https://github.com/firecracker-microvm/firecracker/pull/5762): Cap
+  virtio-rng per-request entropy to 64 KiB. Previously, a guest could construct
+  a descriptor chain that caused Firecracker to allocate more host memory than
+  the guest actually provided, potentially leading to excessive host memory
+  consumption.
+- [#5818](https://github.com/firecracker-microvm/firecracker/pull/5818): Enforce
+  the virtio device initialization sequence in the PCI transport, matching the
+  existing MMIO transport behavior. The PCI transport now validates device
+  status transitions, rejects queue configuration writes outside the FEATURES_OK
+  to DRIVER_OK window, rejects feature negotiation outside the DRIVER state,
+  blocks re-initialization after a failed reset, and sets DEVICE_NEEDS_RESET
+  when device activation fails.
+- [#5818](https://github.com/firecracker-microvm/firecracker/pull/5818): Reject
+  device status writes that clear previously set bits in the MMIO transport,
+  except for reset.
+- [#5780](https://github.com/firecracker-microvm/firecracker/pull/5780): Fixed
+  missing `/sys/devices/system/cpu/cpu*/cache/*` in aarch64 guests when running
+  on host kernels >= 6.3 with guest kernels >= 6.1.156.
+- [#5793](https://github.com/firecracker-microvm/firecracker/pull/5793): Fixed
+  virtio-mem plug/unplug skipping KVM slot updates for memory blocks not aligned
+  to a slot boundary. On plug, this could leave hotplugged memory inaccessible
+  to the guest. On unplug, the guest could retain access to memory that
+  Firecracker considered freed.
+- [#5794](https://github.com/firecracker-microvm/firecracker/pull/5794): Bound
+  balloon statistics descriptor length to prevent a guest-controlled oversized
+  descriptor from temporarily stalling the VMM event loop. Only affects microVMs
+  with `stats_polling_interval_s > 0`.
+- [#5809](https://github.com/firecracker-microvm/firecracker/pull/5809): Fixed a
+  bug on host Linux >= 5.16 for x86_64 guests using the `kvm-clock` clock source
+  causing the monotonic clock to jump on restore by the wall-clock time elapsed
+  since the snapshot was taken. Users using `kvm-clock` that want to explicitly
+  advance the clock with `KVM_CLOCK_REALTIME` can opt back in using the new
+  `clock_realtime` flag in `LoadSnapshot` API.
+
+## [1.14.3]
+
+### Fixed
+
+- [#5739](https://github.com/firecracker-microvm/firecracker/pull/5739): Fixed
+  validation of TCP SYN options length when MMDS is enabled.
+
+## [1.14.2]
+
+### Fixed
+
+- [#5698](https://github.com/firecracker-microvm/firecracker/pull/5698): Fixed
+  the possible ENXIO error which could occur during file open operation if the
+  underlying file is FIFO without active readers already attached.
+- [#5705](https://github.com/firecracker-microvm/firecracker/pull/5705): Fixed a
+  bug that caused Firecracker to corrupt the memory files of differential
+  snapshots for VMs with multiple memory slots. This affected VMs using memory
+  hot-plugging or any x86 VMs with a memory size larger than 3GiB.
+
 ## [1.14.1]
 
 ### Changed

@@ -32,6 +32,9 @@
                 "syscall": "mincore"
             },
             {
+                "syscall": "pread64"
+            },
+            {
                 "syscall": "writev",
                 "comment": "Used by the VirtIO net device to write to tap"
             },

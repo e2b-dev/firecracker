@@ -59,6 +59,24 @@ pub enum MemoryError {
     Unaligned,
     /// Error protecting memory slot: {0}
     Mprotect(std::io::Error),
+    /// Size too large for i64 conversion
+    SlotSizeTooLarge,
+    /// Dirty bitmap not found for memory slot {0}
+    DirtyBitmapNotFound(u32),
+    /// Dirty bitmap is larger than the slot size
+    DirtyBitmapTooLarge,
+    /// Dirty bitmap is smaller than the slot size
+    DirtyBitmapTooSmall,
+    /// Seek error: {0}
+    SeekError(std::io::Error),
+    /// Volatile memory error: {0}
+    VolatileMemoryError(vm_memory::VolatileMemoryError),
+}
+
+impl From<vm_memory::VolatileMemoryError> for MemoryError {
+    fn from(e: vm_memory::VolatileMemoryError) -> Self {
+        MemoryError::VolatileMemoryError(e)
+    }
 }
 
 /// Type of the guest region
@@ -121,11 +139,18 @@ impl<'a> GuestMemorySlot<'a> {
         writer: &mut T,
         kvm_bitmap: &[u64],
         page_size: usize,
-    ) -> Result<(), GuestMemoryError> {
+    ) -> Result<(), MemoryError> {
         let firecracker_bitmap = self.slice.bitmap();
         let mut write_size = 0;
         let mut skip_size = 0;
         let mut dirty_batch_start = 0;
+
+        let expected_bitmap_array_len = (self.slice.len() / page_size).div_ceil(64);
+        if kvm_bitmap.len() > expected_bitmap_array_len {
+            return Err(MemoryError::DirtyBitmapTooLarge);
+        } else if kvm_bitmap.len() < expected_bitmap_array_len {
+            return Err(MemoryError::DirtyBitmapTooSmall);
+        }
 
         for (i, v) in kvm_bitmap.iter().enumerate() {
             for j in 0..64 {
@@ -133,13 +158,28 @@ impl<'a> GuestMemorySlot<'a> {
                 let page_offset = ((i * 64) + j) * page_size;
                 let is_firecracker_page_dirty = firecracker_bitmap.dirty_at(page_offset);
 
+                // We process 64 pages at a time, however the number of pages
+                // in the slot might not be a multiple of 64. We need to break
+                // once we go past the last page that is actually part of the
+                // region.
+                if page_offset >= self.slice.len() {
+                    // Ensure there are no more dirty bits after this point
+                    if (v >> j) != 0 {
+                        return Err(MemoryError::DirtyBitmapTooLarge);
+                    }
+                    break;
+                }
+
                 if is_kvm_page_dirty || is_firecracker_page_dirty {
                     // We are at the start of a new batch of dirty pages.
                     if skip_size > 0 {
                         // Seek forward over the unmodified pages.
+                        let offset = skip_size
+                            .try_into()
+                            .map_err(|_| MemoryError::SlotSizeTooLarge)?;
                         writer
-                            .seek(SeekFrom::Current(skip_size.try_into().unwrap()))
-                            .unwrap();
+                            .seek(SeekFrom::Current(offset))
+                            .map_err(MemoryError::SeekError)?;
                         dirty_batch_start = page_offset;
                         skip_size = 0;
                     }
@@ -159,6 +199,14 @@ impl<'a> GuestMemorySlot<'a> {
 
         if write_size > 0 {
             writer.write_all_volatile(&self.slice.subslice(dirty_batch_start, write_size)?)?;
+        }
+
+        // Advance the cursor even if the trailing pages are clean, so that the
+        // next slot starts writing at the correct offset.
+        if skip_size > 0 {
+            writer
+                .seek(SeekFrom::Current(skip_size.try_into().unwrap()))
+                .map_err(MemoryError::SeekError)?;
         }
 
         Ok(())
@@ -184,14 +232,6 @@ impl<'a> GuestMemorySlot<'a> {
         } else {
             Ok(())
         }
-    }
-}
-
-fn addr_in_range(addr: GuestAddress, start: GuestAddress, len: usize) -> bool {
-    if let Some(end) = start.checked_add(len as u64) {
-        addr >= start && addr < end
-    } else {
-        false
     }
 }
 
@@ -297,11 +337,17 @@ impl GuestRegionMmapExt {
         len: usize,
     ) -> impl Iterator<Item = GuestMemorySlot<'_>> {
         self.slots().map(|(slot, _)| slot).filter(move |slot| {
-            if let Some(slot_end) = slot.guest_addr.checked_add(slot.slice.len() as u64) {
-                addr_in_range(slot.guest_addr, from, len) || addr_in_range(slot_end, from, len)
-            } else {
-                false
-            }
+            // Two intervals [a, b) and [c, d) intersect iff a < d && c < b.
+            // This correctly handles the containment case where the slot fully
+            // contains the range (or vice versa).
+            let slot_start = slot.guest_addr;
+            let Some(slot_end) = slot_start.checked_add(slot.slice.len() as u64) else {
+                return false;
+            };
+            let Some(range_end) = from.checked_add(len as u64) else {
+                return false;
+            };
+            slot_start < range_end && from < slot_end
         })
     }
 
@@ -668,10 +714,15 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                 .flat_map(|region| region.slots())
                 .try_for_each(|(mem_slot, plugged)| {
                     if !plugged {
-                        let ilen = i64::try_from(mem_slot.slice.len()).unwrap();
-                        writer.seek(SeekFrom::Current(ilen)).unwrap();
+                        let ilen = i64::try_from(mem_slot.slice.len())
+                            .map_err(|_| MemoryError::SlotSizeTooLarge)?;
+                        writer
+                            .seek(SeekFrom::Current(ilen))
+                            .map_err(MemoryError::SeekError)?;
                     } else {
-                        let kvm_bitmap = dirty_bitmap.get(&mem_slot.slot).unwrap();
+                        let kvm_bitmap = dirty_bitmap
+                            .get(&mem_slot.slot)
+                            .ok_or(MemoryError::DirtyBitmapNotFound(mem_slot.slot))?;
                         mem_slot.dump_dirty(writer, kvm_bitmap, page_size)?;
                     }
                     Ok(())
@@ -683,7 +734,7 @@ impl GuestMemoryExtension for GuestMemoryMmap {
             self.reset_dirty();
         }
 
-        write_result.map_err(MemoryError::WriteMemory)
+        write_result
     }
 
     /// Resets all the memory region bitmaps
@@ -814,6 +865,7 @@ mod tests {
 
     use std::collections::HashMap;
     use std::io::{Read, Seek, Write};
+    use std::os::unix::fs::MetadataExt;
 
     use vmm_sys_util::tempfile::TempFile;
 
@@ -1123,17 +1175,23 @@ mod tests {
             .write(&second_region, region_2_address)
             .unwrap();
 
+        // Firecracker Dirty Bitmap after the writes:
+        // First region pages: [dirty, dirty]
+        // Second region pages: [dirty, dirty]
+
         let memory_state = guest_memory.describe();
 
-        // Dump only the dirty pages.
+        // KVM dirty bitmap:
         // First region pages: [dirty, clean]
         // Second region pages: [clean, dirty]
-        let mut dirty_bitmap: DirtyBitmap = HashMap::new();
-        dirty_bitmap.insert(0, vec![0b01]);
-        dirty_bitmap.insert(1, vec![0b10]);
+        let mut kvm_dirty_bitmap: DirtyBitmap = HashMap::new();
+        kvm_dirty_bitmap.insert(0, vec![0b01]);
+        kvm_dirty_bitmap.insert(1, vec![0b10]);
 
         let mut file = TempFile::new().unwrap().into_file();
-        guest_memory.dump_dirty(&mut file, &dirty_bitmap).unwrap();
+        guest_memory
+            .dump_dirty(&mut file, &kvm_dirty_bitmap)
+            .unwrap();
 
         // We can restore from this because this is the first dirty dump.
         let restored_guest_memory =
@@ -1158,18 +1216,25 @@ mod tests {
         let ones = vec![1u8; page_size];
         let twos = vec![2u8; page_size];
 
-        // Firecracker Bitmap
-        // First region pages: [dirty, clean]
+        // Firecracker Dirty Bitmap:
+        // First region pages: [clean, dirty]
         // Second region pages: [clean, clean]
         guest_memory
             .write(&twos, GuestAddress(page_size as u64))
             .unwrap();
+        // KVM dirty bitmap:
+        // First region pages: [dirty, clean]
+        // Second region pages: [clean, dirty]
+        kvm_dirty_bitmap.insert(0, vec![0b01]);
+        kvm_dirty_bitmap.insert(1, vec![0b10]);
 
-        guest_memory.dump_dirty(&mut reader, &dirty_bitmap).unwrap();
+        guest_memory
+            .dump_dirty(&mut reader, &kvm_dirty_bitmap)
+            .unwrap();
 
         // Check that only the dirty regions are dumped.
         let mut diff_file_content = Vec::new();
-        let expected_first_region = [
+        let expected_file_contents = [
             ones.as_slice(),
             twos.as_slice(),
             zeros.as_slice(),
@@ -1178,7 +1243,71 @@ mod tests {
         .concat();
         reader.seek(SeekFrom::Start(0)).unwrap();
         reader.read_to_end(&mut diff_file_content).unwrap();
-        assert_eq!(expected_first_region, diff_file_content);
+        assert_eq!(expected_file_contents, diff_file_content);
+
+        // Take a 3rd snapshot
+
+        // Firecracker Dirty Bitmap:
+        // First region pages: [dirty, clean]
+        // Second region pages: [dirty, clean]
+        guest_memory.write(&twos, region_1_address).unwrap();
+        guest_memory.write(&ones, region_2_address).unwrap();
+        // KVM dirty bitmap:
+        // First region pages: [clean, clean]
+        // Second region pages: [clean, clean]
+        kvm_dirty_bitmap.insert(0, vec![0b00]);
+        kvm_dirty_bitmap.insert(1, vec![0b00]);
+
+        let file = TempFile::new().unwrap();
+        let logical_size = page_size as u64 * 4;
+        file.as_file().set_len(logical_size).unwrap();
+
+        let mut reader = file.into_file();
+        guest_memory
+            .dump_dirty(&mut reader, &kvm_dirty_bitmap)
+            .unwrap();
+
+        // Check that only the dirty regions are dumped.
+        let mut diff_file_content = Vec::new();
+        // The resulting file is a sparse file with holes.
+        let expected_file_contents = [
+            twos.as_slice(),
+            zeros.as_slice(), // hole
+            ones.as_slice(),
+            zeros.as_slice(), // hole
+        ]
+        .concat();
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_to_end(&mut diff_file_content).unwrap();
+
+        assert_eq!(expected_file_contents, diff_file_content);
+
+        // Make sure that only 2 of the pages are written in the file and the
+        // other two are holes.
+        let metadata = reader.metadata().unwrap();
+        let physical_size = metadata.blocks() * 512;
+        assert_eq!(physical_size, 2 * page_size as u64);
+        assert_ne!(physical_size, logical_size);
+
+        // Test with bitmaps that are too large or too small
+        kvm_dirty_bitmap.insert(0, vec![0b1, 0b01]);
+        kvm_dirty_bitmap.insert(1, vec![0b10]);
+        assert!(matches!(
+            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap),
+            Err(MemoryError::DirtyBitmapTooLarge)
+        ));
+        kvm_dirty_bitmap.insert(0, vec![0b01]);
+        kvm_dirty_bitmap.insert(1, vec![0b110]);
+        assert!(matches!(
+            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap),
+            Err(MemoryError::DirtyBitmapTooLarge)
+        ));
+        kvm_dirty_bitmap.insert(0, vec![]);
+        kvm_dirty_bitmap.insert(1, vec![0b10]);
+        assert!(matches!(
+            guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap),
+            Err(MemoryError::DirtyBitmapTooSmall)
+        ));
     }
 
     #[test]
@@ -1329,5 +1458,58 @@ mod tests {
                 .unwrap_err(),
             GuestMemoryError::IOError(_)
         );
+    }
+
+    /// Verifies that `slots_intersecting_range` returns the correct slots for
+    /// ranges at slot boundaries, interior to a slot, and spanning two slots.
+    #[test]
+    fn test_slots_intersecting_range() {
+        let page_size = get_page_size().unwrap();
+        let slot_size = 4 * page_size;
+        let region_size = 2 * slot_size;
+        let base = GuestAddress(0);
+        let slot1_base = base.unchecked_add(slot_size as u64);
+
+        let mmap_region = anonymous(
+            std::iter::once((base, region_size)),
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+        let region = GuestRegionMmapExt::hotpluggable_from_mmap_region(mmap_region, 0, slot_size);
+        assert_eq!(region.slot_cnt(), 2);
+
+        // (range_offset_in_pages, range_len_in_pages, expected_slot_addrs)
+        let cases: &[(usize, usize, &[GuestAddress])] = &[
+            // At slot 0 boundary
+            (0, 1, &[base]),
+            // Interior to slot 0
+            (1, 1, &[base]),
+            // Interior to slot 1
+            (5, 1, &[slot1_base]),
+            // Spanning slot 0 and slot 1
+            (3, 2, &[base, slot1_base]),
+            // Entire region
+            (0, 8, &[base, slot1_base]),
+            // Outside the region
+            (8, 1, &[]),
+            // Zero-length range
+            (0, 0, &[]),
+        ];
+
+        for &(offset_pages, len_pages, expected) in cases {
+            let from = base.unchecked_add((offset_pages * page_size) as u64);
+            let len = len_pages * page_size;
+            let found: Vec<_> = region.slots_intersecting_range(from, len).collect();
+            let addrs: Vec<_> = found.iter().map(|s| s.guest_addr).collect();
+            assert_eq!(
+                addrs, expected,
+                "offset={offset_pages} pages, len={len_pages} pages"
+            );
+        }
     }
 }

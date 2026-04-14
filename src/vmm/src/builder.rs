@@ -318,6 +318,7 @@ pub fn build_microvm_for_boot(
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
         device_manager,
+        page_size: vm_resources.machine_config.huge_pages.page_size(),
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -423,6 +424,8 @@ pub enum BuildMicrovmFromSnapshotError {
     SeccompFiltersInternal(#[from] crate::seccomp::InstallationError),
     /// Failed to restore devices: {0}
     RestoreDevices(#[from] DevicePersistError),
+    /// clock_realtime is not supported on aarch64.
+    UnsupportedClockRealtime,
 }
 
 /// Builds and starts a microVM based on the provided MicrovmState.
@@ -438,6 +441,7 @@ pub fn build_microvm_from_snapshot(
     uffd: Option<Uffd>,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
+    clock_realtime: bool,
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
@@ -479,6 +483,9 @@ pub fn build_microvm_from_snapshot(
 
     #[cfg(target_arch = "aarch64")]
     {
+        if clock_realtime {
+            return Err(BuildMicrovmFromSnapshotError::UnsupportedClockRealtime);
+        }
         let mpidrs = construct_kvm_mpidrs(&microvm_state.vcpu_states);
         // Restore kvm vm state.
         vm.restore_state(&mpidrs, &microvm_state.vm_state)?;
@@ -486,7 +493,7 @@ pub fn build_microvm_from_snapshot(
 
     // Restore kvm vm state.
     #[cfg(target_arch = "x86_64")]
-    vm.restore_state(&microvm_state.vm_state)?;
+    vm.restore_state(&microvm_state.vm_state, clock_realtime)?;
 
     // Restore the boot source config paths.
     vm_resources.boot_source.config = microvm_state.vm_info.boot_source;
@@ -518,6 +525,7 @@ pub fn build_microvm_from_snapshot(
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
         device_manager,
+        page_size: vm_resources.machine_config.huge_pages.page_size(),
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -751,6 +759,7 @@ pub(crate) mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+    use crate::arch::host_page_size;
     use crate::device_manager::tests::default_device_manager;
     use crate::devices::virtio::block::CacheType;
     use crate::devices::virtio::generated::virtio_ids;
@@ -836,6 +845,7 @@ pub(crate) mod tests {
             vcpus_handles: Vec::new(),
             vcpus_exit_evt,
             device_manager: default_device_manager(),
+            page_size: host_page_size(),
         }
     }
 
