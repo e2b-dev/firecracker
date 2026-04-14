@@ -91,6 +91,9 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Get, "hotplug", None) if path_tokens.next() == Some("memory") => {
                 parse_get_memory_hotplug()
             }
+            (Method::Get, "memory", None) if path_tokens.next() == Some("mappings") => {
+                Ok(ParsedRequest::new_sync(VmmAction::GetMemoryMappings))
+            }
             (Method::Get, _, Some(_)) => method_to_error(Method::Get),
             (Method::Put, "actions", Some(body)) => parse_put_actions(body),
             (Method::Put, "balloon", Some(body)) => parse_put_balloon(body),
@@ -182,6 +185,7 @@ impl ParsedRequest {
                 VmmData::MachineConfiguration(machine_config) => {
                     Self::success_response_with_data(machine_config)
                 }
+                VmmData::MemoryMappings(mappings) => Self::success_response_with_data(mappings),
                 VmmData::MmdsValue(value) => Self::success_response_with_mmds_value(value),
                 VmmData::BalloonConfig(balloon_config) => {
                     Self::success_response_with_data(balloon_config)
@@ -599,6 +603,9 @@ pub mod tests {
                 }
                 VmmData::MachineConfiguration(cfg) => {
                     http_response(&serde_json::to_string(cfg).unwrap(), 200)
+                }
+                VmmData::MemoryMappings(mappings) => {
+                    http_response(&serde_json::to_string(mappings).unwrap(), 200)
                 }
                 VmmData::MmdsValue(value) => {
                     http_response(&serde_json::to_string(value).unwrap(), 200)

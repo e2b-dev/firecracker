@@ -460,8 +460,8 @@ impl VmResources {
 
     /// Allocates the given guest memory regions.
     ///
-    /// If vhost-user-blk devices are in use, allocates memfd-backed shared memory, otherwise
-    /// prefers anonymous memory for performance reasons.
+    /// Uses memfd-backed shared memory when `shared_mem` is enabled or vhost-user-blk devices
+    /// are in use. Otherwise prefers anonymous memory for performance reasons.
     fn allocate_memory_regions(
         &self,
         regions: &[(GuestAddress, usize)],
@@ -472,16 +472,7 @@ impl VmResources {
             .iter()
             .any(|b| b.lock().expect("Poisoned lock").is_vhost_user());
 
-        // Page faults are more expensive for shared memory mapping, including  memfd.
-        // For this reason, we only back guest memory with a memfd
-        // if a vhost-user-blk device is configured in the VM, otherwise we fall back to
-        // an anonymous private memory.
-        //
-        // The vhost-user-blk branch is not currently covered by integration tests in Rust,
-        // because that would require running a backend process. If in the future we converge to
-        // a single way of backing guest memory for vhost-user and non-vhost-user cases,
-        // that would not be worth the effort.
-        if vhost_user_device_used {
+        if self.machine_config.shared_mem || vhost_user_device_used {
             memory::memfd_backed(
                 regions,
                 self.machine_config.track_dirty_pages,

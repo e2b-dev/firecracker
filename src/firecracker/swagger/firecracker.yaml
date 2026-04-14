@@ -1406,11 +1406,17 @@ definitions:
         description: The size of the region in bytes.
         type: integer
       offset:
-        description: The offset of the region in bytes.
+        description: The offset of the region within the backing memfd, in bytes.
         type: integer
       page_size:
         description: The page size in bytes.
         type: integer
+      memfd_fd:
+        type: integer
+        description: >-
+          The memfd file descriptor number inside the Firecracker process. The
+          orchestrator can open it via /proc/<pid>/fd/<memfd_fd> for zero-copy
+          memory export. Only present when shared_mem is enabled.
 
   MemoryMappingsResponse:
     type: object
@@ -1523,6 +1529,13 @@ definitions:
           - None
           - 2M
         description: Which huge pages configuration (if any) should be used to back guest memory.
+      shared_mem:
+        type: boolean
+        description: >-
+          Back guest memory with a memfd (MAP_SHARED) instead of anonymous memory
+          (MAP_PRIVATE). Allows the orchestrator to grab the memfd fd via
+          /proc/<pid>/fd/ for lazy memory export and incremental hugepage release.
+        default: false
 
   MemoryBackend:
     type: object

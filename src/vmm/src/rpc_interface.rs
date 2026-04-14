@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt::{self, Debug};
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
 
@@ -44,6 +46,31 @@ use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, Snap
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
 
+/// Describes a single guest memory region mapping for the orchestrator.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestMemoryRegionInfo {
+    /// Host virtual address of the region start.
+    pub base_host_virt_addr: u64,
+    /// Size of the region in bytes.
+    pub size: u64,
+    /// Offset of this region within the backing memfd/file.
+    pub offset: u64,
+    /// Page size used for this region.
+    pub page_size: u64,
+    /// The memfd file descriptor number inside this process. The orchestrator can open
+    /// it via `/proc/<pid>/fd/<memfd_fd>` for lazy memory export.
+    /// `None` if the region is not backed by a memfd (anonymous memory).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memfd_fd: Option<i32>,
+}
+
+/// Response for `GET /memory/mappings`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryMappingsInfo {
+    /// The guest memory region mappings.
+    pub mappings: Vec<GuestMemoryRegionInfo>,
+}
+
 /// This enum represents the public interface of the VMM. Each action contains various
 /// bits of information (ids, paths, etc.).
 #[derive(Debug, PartialEq, Eq)]
@@ -70,6 +97,8 @@ pub enum VmmAction {
     GetFullVmConfig,
     /// Get MMDS contents.
     GetMMDS,
+    /// Get the guest memory region mappings (host virtual addresses, sizes, memfd fds).
+    GetMemoryMappings,
     /// Get the machine configuration of the microVM.
     GetVmMachineConfig,
     /// Get microVM instance information.
@@ -218,6 +247,8 @@ pub enum VmmData {
     FullVmConfig(VmmConfig),
     /// The microVM configuration represented by `VmConfig`.
     MachineConfiguration(MachineConfig),
+    /// Guest memory region mappings with memfd fds.
+    MemoryMappings(MemoryMappingsInfo),
     /// Mmds contents.
     MmdsValue(serde_json::Value),
     /// The microVM instance information.
@@ -488,6 +519,7 @@ impl<'a> PrebootApiController<'a> {
             | Resume
             | GetBalloonStats
             | GetMemoryHotplugStatus
+            | GetMemoryMappings
             | UpdateBalloon(_)
             | UpdateBalloonStatistics(_)
             | UpdateBlockDevice(_)
@@ -711,6 +743,7 @@ impl RuntimeApiController {
                 .memory_hotplug_status()
                 .map(VmmData::VirtioMemStatus)
                 .map_err(VmmActionError::InternalVmm),
+            GetMemoryMappings => self.get_memory_mappings(),
             GetMMDS => self.get_mmds(),
             GetVmMachineConfig => Ok(VmmData::MachineConfiguration(
                 self.vm_resources.machine_config.clone(),
@@ -794,6 +827,44 @@ impl RuntimeApiController {
     /// Creates a new `RuntimeApiController`.
     pub fn new(vm_resources: VmResources, vmm: Arc<Mutex<Vmm>>) -> Self {
         Self { vmm, vm_resources }
+    }
+
+    fn get_memory_mappings(&self) -> Result<VmmData, VmmActionError> {
+        use vm_memory::{GuestMemory, GuestMemoryRegion};
+
+        let vmm = self.vmm.lock().expect("Poisoned lock");
+        let guest_memory = vmm.vm.guest_memory();
+        let page_size = self.vm_resources.machine_config.huge_pages.page_size() as u64;
+
+        let mut offset_accum: u64 = 0;
+        let mappings: Vec<GuestMemoryRegionInfo> = guest_memory
+            .iter()
+            .map(|region| {
+                let host_addr = region
+                    .get_host_address(vm_memory::MemoryRegionAddress(0))
+                    .unwrap() as u64;
+                let size = region.len();
+
+                let (offset, memfd_fd) = match region.file_offset() {
+                    Some(fo) => (fo.start(), Some(fo.file().as_raw_fd())),
+                    None => {
+                        let off = offset_accum;
+                        offset_accum += size;
+                        (off, None)
+                    }
+                };
+
+                GuestMemoryRegionInfo {
+                    base_host_virt_addr: host_addr,
+                    size,
+                    offset,
+                    page_size,
+                    memfd_fd,
+                }
+            })
+            .collect();
+
+        Ok(VmmData::MemoryMappings(MemoryMappingsInfo { mappings }))
     }
 
     /// Pauses the microVM by pausing the vCPUs.
