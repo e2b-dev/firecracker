@@ -5,7 +5,7 @@ use std::fmt::{self, Debug};
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
 
@@ -46,28 +46,28 @@ use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, Snap
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
 
-/// Describes a single guest memory region mapping for the orchestrator.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A guest memory region mapping returned by `GET /memory/mappings`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct GuestMemoryRegionInfo {
     /// Host virtual address of the region start.
     pub base_host_virt_addr: u64,
     /// Size of the region in bytes.
     pub size: u64,
-    /// Offset of this region within the backing memfd/file.
+    /// Offset within the backing memfd.
     pub offset: u64,
     /// Page size used for this region.
     pub page_size: u64,
-    /// The memfd file descriptor number inside this process. The orchestrator can open
-    /// it via `/proc/<pid>/fd/<memfd_fd>` for lazy memory export.
-    /// `None` if the region is not backed by a memfd (anonymous memory).
+    /// Memfd file descriptor number in this process. The orchestrator reads the
+    /// backing file via `/proc/<pid>/fd/<memfd_fd>` for lazy memory export.
+    /// Only present when `shared_mem` is enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memfd_fd: Option<i32>,
 }
 
 /// Response for `GET /memory/mappings`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MemoryMappingsInfo {
-    /// The guest memory region mappings.
+    /// Guest memory region mappings.
     pub mappings: Vec<GuestMemoryRegionInfo>,
 }
 
@@ -836,7 +836,6 @@ impl RuntimeApiController {
         let guest_memory = vmm.vm.guest_memory();
         let page_size = self.vm_resources.machine_config.huge_pages.page_size() as u64;
 
-        let mut offset_accum: u64 = 0;
         let mappings: Vec<GuestMemoryRegionInfo> = guest_memory
             .iter()
             .map(|region| {
@@ -844,15 +843,10 @@ impl RuntimeApiController {
                     .get_host_address(vm_memory::MemoryRegionAddress(0))
                     .unwrap() as u64;
                 let size = region.len();
-
-                let (offset, memfd_fd) = match region.file_offset() {
-                    Some(fo) => (fo.start(), Some(fo.file().as_raw_fd())),
-                    None => {
-                        let off = offset_accum;
-                        offset_accum += size;
-                        (off, None)
-                    }
-                };
+                let (offset, memfd_fd) = region
+                    .file_offset()
+                    .map(|fo| (fo.start(), Some(fo.file().as_raw_fd())))
+                    .unwrap_or((0, None));
 
                 GuestMemoryRegionInfo {
                     base_host_virt_addr: host_addr,
