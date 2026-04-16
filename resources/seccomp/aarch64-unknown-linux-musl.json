@@ -47,6 +47,22 @@
                 "comment": "Used for creating io_uring completion event, on drive patch"
             },
             {
+                "syscall": "io_setup",
+                "comment": "Used by kernel AIO during UFFD+hugepages snapshot restore on aarch64"
+            },
+            {
+                "syscall": "io_destroy",
+                "comment": "Cleanup for io_setup AIO context"
+            },
+            {
+                "syscall": "io_submit",
+                "comment": "Submit AIO requests during UFFD+hugepages snapshot restore"
+            },
+            {
+                "syscall": "io_getevents",
+                "comment": "Wait for AIO completion during UFFD+hugepages snapshot restore"
+            },
+            {
                 "syscall": "io_uring_enter",
                 "comment": "Used for submitting io_uring requests"
             },
