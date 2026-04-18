@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use userfaultfd::{FeatureFlags, RegisterMode, Uffd, UffdBuilder};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
@@ -553,9 +553,23 @@ fn guest_memory_from_uffd(
         .create()
         .map_err(GuestMemoryFromUffdError::Create)?;
 
+    // Register every region for both MISSING and WRITE_PROTECT faults.
+    //
+    // MISSING is needed so the orchestrator's UFFD handler is woken up the first time the guest
+    // touches a page that has not yet been populated from the snapshot's memory file.
+    //
+    // WRITE_PROTECT is needed so the handler can keep pages it serves in a write-protected state
+    // (via UFFDIO_COPY_MODE_WP) and observe subsequent writes as new faults — the standard CoW
+    // tracking pattern that lets the orchestrator know which pages got dirtied after restore.
+    // Without WRITE_PROTECT registration, UFFDIO_COPY with MODE_WP fails synchronously with
+    // EINVAL on the very first read fault, breaking the snapshot resume path.
     for mem_region in guest_memory.iter() {
-        uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
-            .map_err(GuestMemoryFromUffdError::Register)?;
+        uffd.register_with_mode(
+            mem_region.as_ptr().cast(),
+            mem_region.size() as _,
+            RegisterMode::MISSING | RegisterMode::WRITE_PROTECT,
+        )
+        .map_err(GuestMemoryFromUffdError::Register)?;
     }
 
     send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
