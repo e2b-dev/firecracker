@@ -1437,6 +1437,7 @@ mod tests {
                 mem_backend: MemBackendConfig {
                     backend_type: MemBackendType::File,
                     backend_path: PathBuf::new(),
+                    use_memfd: false,
                 },
                 track_dirty_pages: false,
                 resume_vm: false,

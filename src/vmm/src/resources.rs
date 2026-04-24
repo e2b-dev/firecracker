@@ -482,11 +482,12 @@ impl VmResources {
         // a single way of backing guest memory for vhost-user and non-vhost-user cases,
         // that would not be worth the effort.
         if vhost_user_device_used {
-            memory::memfd_backed(
+            Ok(memory::memfd_backed(
                 regions,
                 self.machine_config.track_dirty_pages,
                 self.machine_config.huge_pages,
-            )
+            )?
+            .0)
         } else {
             memory::anonymous(
                 regions.iter().copied(),

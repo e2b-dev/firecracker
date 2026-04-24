@@ -493,11 +493,10 @@ impl GuestMemoryRegion for GuestRegionMmapExt {
 pub fn create(
     regions: impl Iterator<Item = (GuestAddress, usize)>,
     mmap_flags: libc::c_int,
-    file: Option<File>,
+    file: Option<Arc<File>>,
     track_dirty_pages: bool,
 ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
     let mut offset = 0;
-    let file = file.map(Arc::new);
     regions
         .map(|(start, size)| {
             let mut builder = MmapRegionBuilder::new_with_bitmap(
@@ -535,16 +534,18 @@ pub fn memfd_backed(
     regions: &[(GuestAddress, usize)],
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
-) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+) -> Result<(Vec<GuestRegionMmap>, Arc<File>), MemoryError> {
     let size = regions.iter().map(|&(_, size)| size as u64).sum();
-    let memfd_file = create_memfd(size, huge_pages.into())?.into_file();
+    let memfd_file = Arc::new(create_memfd(size, huge_pages.into())?.into_file());
 
-    create(
+    let regions = create(
         regions.iter().copied(),
         libc::MAP_SHARED | huge_pages.mmap_flags(),
-        Some(memfd_file),
+        Some(Arc::clone(&memfd_file)),
         track_dirty_pages,
-    )
+    )?;
+
+    Ok((regions, memfd_file))
 }
 
 /// Creates a GuestMemoryMmap from raw regions.
@@ -584,7 +585,7 @@ pub fn snapshot_file(
     create(
         regions.into_iter(),
         libc::MAP_PRIVATE,
-        Some(file),
+        Some(Arc::new(file)),
         track_dirty_pages,
     )
 }
@@ -812,7 +813,8 @@ impl GuestMemoryExtension for GuestMemoryMmap {
     }
 }
 
-fn create_memfd(
+/// Creates a sealed memfd of `mem_size` bytes, optionally backed by huge pages.
+pub fn create_memfd(
     mem_size: u64,
     hugetlb_size: Option<memfd::HugetlbSize>,
 ) -> Result<memfd::Memfd, MemoryError> {

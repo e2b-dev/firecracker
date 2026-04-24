@@ -118,6 +118,10 @@ pub struct MemBackendConfig {
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+    /// When true, guest memory is backed by a memfd and its file descriptor is sent to the UFFD
+    /// handler over the UFFD socket. Only valid when `backend_type` is `Uffd`.
+    #[serde(default)]
+    pub use_memfd: bool,
 }
 
 /// The microVM state options.
