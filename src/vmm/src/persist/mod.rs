@@ -7,14 +7,16 @@ use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::forget;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use userfaultfd::{FeatureFlags, RegisterMode, Uffd, UffdBuilder};
+use vm_memory::GuestAddress;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
@@ -29,7 +31,7 @@ use crate::device_manager::{DevicePersistError, DevicesState};
 use crate::logger::{info, warn};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, SnapshotError, SnapshotHdr};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
@@ -42,6 +44,10 @@ use crate::vstate::memory::{
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
 use crate::{EventManager, Vmm, vstate};
+
+pub(crate) mod v1_10;
+pub(crate) mod v1_12;
+pub(crate) mod v1_14;
 
 /// Holds information related to the VM that is not part of VmState.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -161,8 +167,10 @@ pub fn create_snapshot(
 
     snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
 
-    vmm.vm
-        .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    if let Some(mem_file_path) = params.mem_file_path.as_ref() {
+        vmm.vm
+            .snapshot_memory_to_file(mem_file_path, params.snapshot_type, vmm.page_size)?;
+    }
 
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is that we don't mark pages as dirty during runtime
@@ -416,6 +424,7 @@ pub fn restore_from_snapshot(
             mem_state,
             track_dirty_pages,
             vm_resources.machine_config.huge_pages,
+            params.mem_backend.use_memfd,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
     };
@@ -427,6 +436,7 @@ pub fn restore_from_snapshot(
         uffd,
         seccomp_filters,
         vm_resources,
+        params.clock_realtime,
     )
     .map_err(RestoreFromSnapshotError::Build)
 }
@@ -445,10 +455,36 @@ pub enum SnapshotStateFromFileError {
 fn snapshot_state_from_file(
     snapshot_path: &Path,
 ) -> Result<MicrovmState, SnapshotStateFromFileError> {
-    let mut snapshot_reader = File::open(snapshot_path)?;
-    let snapshot = Snapshot::load(&mut snapshot_reader)?;
+    let start = Instant::now();
 
-    Ok(snapshot.data)
+    let data = std::fs::read(snapshot_path)?;
+    let version = SnapshotHdr::load(&mut data.as_slice())?.version;
+
+    let mut snapshot_reader = data.as_slice();
+    let data = match (version.major, version.minor) {
+        (8, 0) => Snapshot::load(&mut snapshot_reader)?.data,
+        (6, 0) => {
+            let v12_state = Snapshot::<v1_12::MicrovmState>::load(&mut snapshot_reader)?;
+            MicrovmState::try_from(v12_state.data).unwrap()
+        }
+        (4, 0) => {
+            let v10_state = Snapshot::<v1_10::MicrovmState>::load(&mut snapshot_reader)?;
+            let v12_state = v1_12::MicrovmState::from(v10_state.data);
+            MicrovmState::try_from(v12_state).unwrap()
+        }
+        _ => {
+            return Err(SnapshotStateFromFileError::Load(
+                SnapshotError::InvalidFormatVersion(version),
+            ));
+        }
+    };
+
+    info!(
+        "Loading snapshot file took {} usec",
+        start.elapsed().as_micros()
+    );
+
+    Ok(data)
 }
 
 /// Error type for [`guest_memory_from_file`].
@@ -481,6 +517,8 @@ pub enum GuestMemoryFromUffdError {
     Create(userfaultfd::Error),
     /// Failed to register memory address range with the userfaultfd object: {0}
     Register(userfaultfd::Error),
+    /// Failed to enable write protection on memory address range with the userfaultfd object: {0}
+    WriteProtect(userfaultfd::Error),
     /// Failed to connect to UDS Unix stream: {0}
     Connect(#[from] std::io::Error),
     /// Failed to sends file descriptor: {0}
@@ -492,9 +530,10 @@ fn guest_memory_from_uffd(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
+    use_memfd: bool,
 ) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
-    let (guest_memory, backend_mappings) =
-        create_guest_memory(mem_state, track_dirty_pages, huge_pages)?;
+    let (guest_memory, backend_mappings, file) =
+        create_guest_memory(mem_state, track_dirty_pages, huge_pages, use_memfd)?;
 
     let mut uffd_builder = UffdBuilder::new();
 
@@ -502,7 +541,9 @@ fn guest_memory_from_uffd(
     // because the only place the kernel checks this is in a hook from madvise, e.g. it doesn't
     // actively change the behavior of UFFD, only passively. Without balloon devices
     // we never call madvise anyway, so no need to put this into a conditional.
-    uffd_builder.require_features(FeatureFlags::EVENT_REMOVE);
+    uffd_builder.require_features(
+        FeatureFlags::EVENT_REMOVE | FeatureFlags::MISSING_HUGETLBFS | FeatureFlags::WP_ASYNC,
+    );
 
     let uffd = uffd_builder
         .close_on_exec(true)
@@ -512,21 +553,58 @@ fn guest_memory_from_uffd(
         .map_err(GuestMemoryFromUffdError::Create)?;
 
     for mem_region in guest_memory.iter() {
-        uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
-            .map_err(GuestMemoryFromUffdError::Register)?;
+        uffd.register_with_mode(
+            mem_region.as_ptr().cast(),
+            mem_region.size() as _,
+            RegisterMode::MISSING | RegisterMode::WRITE_PROTECT,
+        )
+        .map_err(GuestMemoryFromUffdError::Register)?;
+
+        // If memory is backed by huge pages, we can immediately write protect it.
+        // Otherwise (memory is backed by anonymous memory), write protecting here
+        // won't have any effect, as the write-protection bit for a bitwill be
+        // wiped when the first page fault occurs. These cases need to be handled
+        // directly from the UFFD handler.
+        if huge_pages.is_hugetlbfs() {
+            uffd.write_protect(mem_region.as_ptr().cast(), mem_region.size() as _)
+                .map_err(GuestMemoryFromUffdError::WriteProtect)?;
+        }
     }
 
-    send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
+    send_uffd_handshake(
+        mem_uds_path,
+        &backend_mappings,
+        &uffd,
+        file.as_ref().map(|f| f.as_raw_fd()),
+    )?;
 
     Ok((guest_memory, Some(uffd)))
 }
+
+type GuestMemoryComponents = (
+    Vec<GuestRegionMmap>,
+    Vec<GuestRegionUffdMapping>,
+    Option<Arc<File>>,
+);
 
 fn create_guest_memory(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
-) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
-    let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
+    use_memfd: bool,
+) -> Result<GuestMemoryComponents, GuestMemoryFromUffdError> {
+    let regions: Vec<(GuestAddress, usize)> = mem_state.regions().collect();
+
+    let (guest_memory, file) = if use_memfd {
+        let (guest_memory, file) =
+            memory::memfd_backed(regions.as_slice(), track_dirty_pages, huge_pages)?;
+        (guest_memory, Some(file))
+    } else {
+        let guest_memory =
+            memory::anonymous(regions.iter().copied(), track_dirty_pages, huge_pages)?;
+        (guest_memory, None)
+    };
+
     let mut backend_mappings = Vec::with_capacity(guest_memory.len());
     let mut offset = 0;
     for mem_region in guest_memory.iter() {
@@ -541,53 +619,57 @@ fn create_guest_memory(
         offset += mem_region.size() as u64;
     }
 
-    Ok((guest_memory, backend_mappings))
+    Ok((guest_memory, backend_mappings, file))
 }
 
 fn send_uffd_handshake(
     mem_uds_path: &Path,
     backend_mappings: &[GuestRegionUffdMapping],
     uffd: &impl AsRawFd,
+    memfd: Option<RawFd>,
 ) -> Result<(), GuestMemoryFromUffdError> {
     // This is safe to unwrap() because we control the contents of the vector
     // (i.e GuestRegionUffdMapping entries).
     let backend_mappings = serde_json::to_string(backend_mappings).unwrap();
 
     let socket = UnixStream::connect(mem_uds_path)?;
-    socket.send_with_fd(
-        backend_mappings.as_bytes(),
-        // In the happy case we can close the fd since the other process has it open and is
-        // using it to serve us pages.
-        //
-        // The problem is that if other process crashes/exits, firecracker guest memory
-        // will simply revert to anon-mem behavior which would lead to silent errors and
-        // undefined behavior.
-        //
-        // To tackle this scenario, the page fault handler can notify Firecracker of any
-        // crashes/exits. There is no need for Firecracker to explicitly send its process ID.
-        // The external process can obtain Firecracker's PID by calling `getsockopt` with
-        // `libc::SO_PEERCRED` option like so:
-        //
-        // let mut val = libc::ucred { pid: 0, gid: 0, uid: 0 };
-        // let mut ucred_size: u32 = mem::size_of::<libc::ucred>() as u32;
-        // libc::getsockopt(
-        //      socket.as_raw_fd(),
-        //      libc::SOL_SOCKET,
-        //      libc::SO_PEERCRED,
-        //      &mut val as *mut _ as *mut _,
-        //      &mut ucred_size as *mut libc::socklen_t,
-        // );
-        //
-        // Per this linux man page: https://man7.org/linux/man-pages/man7/unix.7.html,
-        // `SO_PEERCRED` returns the credentials (PID, UID and GID) of the peer process
-        // connected to this socket. The returned credentials are those that were in effect
-        // at the time of the `connect` call.
-        //
-        // Moreover, Firecracker holds a copy of the UFFD fd as well, so that even if the
-        // page fault handler process does not tear down Firecracker when necessary, the
-        // uffd will still be alive but with no one to serve faults, leading to guest freeze.
-        uffd.as_raw_fd(),
-    )?;
+
+    // In the happy case we can close the fd since the other process has it open and is
+    // using it to serve us pages.
+    //
+    // The problem is that if other process crashes/exits, firecracker guest memory
+    // will simply revert to anon-mem behavior which would lead to silent errors and
+    // undefined behavior.
+    //
+    // To tackle this scenario, the page fault handler can notify Firecracker of any
+    // crashes/exits. There is no need for Firecracker to explicitly send its process ID.
+    // The external process can obtain Firecracker's PID by calling `getsockopt` with
+    // `libc::SO_PEERCRED` option like so:
+    //
+    // let mut val = libc::ucred { pid: 0, gid: 0, uid: 0 };
+    // let mut ucred_size: u32 = mem::size_of::<libc::ucred>() as u32;
+    // libc::getsockopt(
+    //      socket.as_raw_fd(),
+    //      libc::SOL_SOCKET,
+    //      libc::SO_PEERCRED,
+    //      &mut val as *mut _ as *mut _,
+    //      &mut ucred_size as *mut libc::socklen_t,
+    // );
+    //
+    // Per this linux man page: https://man7.org/linux/man-pages/man7/unix.7.html,
+    // `SO_PEERCRED` returns the credentials (PID, UID and GID) of the peer process
+    // connected to this socket. The returned credentials are those that were in effect
+    // at the time of the `connect` call.
+    //
+    // Moreover, Firecracker holds a copy of the UFFD fd as well, so that even if the
+    // page fault handler process does not tear down Firecracker when necessary, the
+    // uffd will still be alive but with no one to serve faults, leading to guest freeze.
+    match memfd {
+        Some(fd) => {
+            socket.send_with_fds(&[backend_mappings.as_bytes()], &[uffd.as_raw_fd(), fd])?
+        }
+        None => socket.send_with_fds(&[backend_mappings.as_bytes()], &[uffd.as_raw_fd()])?,
+    };
 
     // We prevent Rust from closing the socket file descriptor to avoid a potential race condition
     // between the mappings message and the connection shutdown. If the latter arrives at the UFFD
@@ -620,6 +702,7 @@ mod tests {
     use crate::vmm_config::balloon::BalloonDeviceConfig;
     use crate::vmm_config::net::NetworkInterfaceConfig;
     use crate::vmm_config::vsock::tests::default_config;
+    use crate::vstate::memory::create_memfd;
     use crate::vstate::memory::{GuestMemoryRegionState, GuestRegionType};
 
     fn default_vmm_with_devices() -> Vmm {
@@ -734,13 +817,90 @@ mod tests {
             }],
         };
 
-        let (_, uffd_regions) =
-            create_guest_memory(&mem_state, false, HugePageConfig::None).unwrap();
+        let (_, uffd_regions, _) =
+            create_guest_memory(&mem_state, false, HugePageConfig::None, false).unwrap();
 
         assert_eq!(uffd_regions.len(), 1);
         assert_eq!(uffd_regions[0].size, 0x20000);
         assert_eq!(uffd_regions[0].offset, 0);
         assert_eq!(uffd_regions[0].page_size, HugePageConfig::None.page_size());
+    }
+
+    fn single_region_mem_state() -> GuestMemoryState {
+        GuestMemoryState {
+            regions: vec![GuestMemoryRegionState {
+                base_address: 0,
+                size: 0x20000,
+                region_type: GuestRegionType::Dram,
+                plugged: vec![true],
+            }],
+        }
+    }
+
+    #[test]
+    fn test_create_guest_memory_memfd_enabled_returns_file() {
+        // When use_memfd is true, create_guest_memory must return Some(file).
+        let mem_state = single_region_mem_state();
+        let (_, _, file) =
+            create_guest_memory(&mem_state, false, HugePageConfig::None, true).unwrap();
+        assert!(
+            file.is_some(),
+            "expected a memfd-backed file when use_memfd=true"
+        );
+    }
+
+    #[test]
+    fn test_create_guest_memory_memfd_disabled_returns_no_file() {
+        // When use_memfd is false, create_guest_memory must return None for the file.
+        let mem_state = single_region_mem_state();
+        let (_, _, file) =
+            create_guest_memory(&mem_state, false, HugePageConfig::None, false).unwrap();
+        assert!(
+            file.is_none(),
+            "expected no backing file when use_memfd=false"
+        );
+    }
+
+    #[test]
+    fn test_send_uffd_handshake_without_memfd() {
+        // Verify that send_uffd_handshake with memfd=None sends exactly one fd (the UFFD)
+        // and that the mapping payload is intact.
+        #[allow(deprecated)]
+        let uffd_regions = vec![GuestRegionUffdMapping {
+            base_host_virt_addr: 0,
+            size: 0x100000,
+            offset: 0,
+            page_size: HugePageConfig::None.page_size(),
+            page_size_kib: HugePageConfig::None.page_size(),
+        }];
+
+        let uds_path = TempFile::new().unwrap();
+        let uds_path = uds_path.as_path();
+        std::fs::remove_file(uds_path).unwrap();
+
+        let listener = UnixListener::bind(uds_path).expect("Cannot bind to socket path");
+
+        // Pass None to signal no memfd is being shared.
+        send_uffd_handshake(uds_path, &uffd_regions, &std::io::stdin(), None).unwrap();
+
+        let (stream, _) = listener.accept().expect("Cannot listen on UDS socket");
+
+        let mut message_buf = vec![0u8; 1024];
+        let (bytes_read, received_fd) = stream
+            .recv_with_fd(&mut message_buf[..])
+            .expect("Cannot recv_with_fd");
+        message_buf.resize(bytes_read, 0);
+
+        // The mapping payload must be correct.
+        let deserialized: Vec<GuestRegionUffdMapping> =
+            serde_json::from_slice(&message_buf).unwrap();
+        assert_eq!(uffd_regions, deserialized);
+
+        // Exactly one fd (the UFFD substitute) must have arrived, with no memfd.
+        // The send_with_fds call with &[uffd_fd] puts all fds in one SCM_RIGHTS message,
+        // so a single recv_with_fd captures every fd sent.  If received_fd is Some, exactly
+        // one fd arrived; no second message or fd was sent.
+        assert!(received_fd.is_some(), "expected the UFFD fd to be received");
     }
 
     #[test]
@@ -767,9 +927,17 @@ mod tests {
         let uds_path = uds_path.as_path();
         std::fs::remove_file(uds_path).unwrap();
 
+        let mock_memfd = create_memfd(1024, None).unwrap().into_file();
+
         let listener = UnixListener::bind(uds_path).expect("Cannot bind to socket path");
 
-        send_uffd_handshake(uds_path, &uffd_regions, &std::io::stdin()).unwrap();
+        send_uffd_handshake(
+            uds_path,
+            &uffd_regions,
+            &std::io::stdin(),
+            Some(mock_memfd.as_raw_fd()),
+        )
+        .unwrap();
 
         let (stream, _) = listener.accept().expect("Cannot listen on UDS socket");
 

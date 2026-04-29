@@ -44,7 +44,7 @@ pub struct CreateSnapshotParams {
     /// Path to the file that will contain the microVM state.
     pub snapshot_path: PathBuf,
     /// Path to the file that will contain the guest memory.
-    pub mem_file_path: PathBuf,
+    pub mem_file_path: Option<PathBuf>,
 }
 
 /// Allows for changing the mapping between tap devices and host devices
@@ -72,6 +72,10 @@ pub struct LoadSnapshotParams {
     pub resume_vm: bool,
     /// The network devices to override on load.
     pub network_overrides: Vec<NetworkOverride>,
+    /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore,
+    /// advancing kvmclock by the wall-clock time elapsed since the snapshot was taken. When false
+    /// (default), kvmclock resumes from where it was at snapshot time.
+    pub clock_realtime: bool,
 }
 
 /// Stores the configuration for loading a snapshot that is provided by the user.
@@ -101,6 +105,9 @@ pub struct LoadSnapshotConfig {
     /// The network devices to override on load.
     #[serde(default)]
     pub network_overrides: Vec<NetworkOverride>,
+    /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore.
+    #[serde(default)]
+    pub clock_realtime: bool,
 }
 
 /// Stores the configuration used for managing snapshot memory.
@@ -111,6 +118,10 @@ pub struct MemBackendConfig {
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+    /// When true, guest memory is backed by a memfd and its file descriptor is sent to the UFFD
+    /// handler over the UFFD socket. Only valid when `backend_type` is `Uffd`.
+    #[serde(default)]
+    pub use_memfd: bool,
 }
 
 /// The microVM state options.

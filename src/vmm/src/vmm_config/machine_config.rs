@@ -288,7 +288,7 @@ impl MachineConfig {
 #[cfg(test)]
 mod tests {
     use crate::cpu_config::templates::{CpuTemplateType, CustomCpuTemplate, StaticCpuTemplate};
-    use crate::vmm_config::machine_config::MachineConfig;
+    use crate::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
 
     // Ensure the special (de)serialization logic for the cpu_template field works:
     // only static cpu templates can be specified via the machine-config endpoint, but
@@ -335,4 +335,5 @@ mod tests {
 
         assert!(deserialized.cpu_template.is_none());
     }
+
 }
