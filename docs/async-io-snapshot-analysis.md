@@ -110,16 +110,26 @@ can corrupt or hang under stress / signals; **L** = low / cosmetic.
 
 ### Per-branch backport status
 
-| Branch | Bug 1 (lib.rs ordering) | Bug 2 (MMIO transport ordering) | Bug 3 (PCI transport ordering) | Notes |
-|---|---|---|---|---|
-| `upstream/main` | fixed | fixed | fixed | upstream `67ba7a206` |
-| `upstream/firecracker-v1.15` | fixed | fixed | fixed | backport `48a5ae3b2` |
-| `upstream/firecracker-v1.14` | **MISSING** | **MISSING** | **MISSING** | last release v1.14.4 (2026-04-02) |
-| `upstream/firecracker-v1.12` | **MISSING** | **MISSING** | N/A (no PCI yet) | |
-| `firecracker-v1.14-direct-mem` (PR #8) | **MISSING** | **MISSING** | **MISSING** | This branch |
-| `firecracker-v1.12-direct-mem` (prod today) | **MISSING** | **MISSING** | N/A | |
+Two distinct upstream commits are involved:
 
-Bugs 4–8 below are not addressed by the upstream fix and apply to all branches.
+- `67ba7a206` — main fix for Bugs 1, 2, 3 (ordering of `device_manager.save()` vs
+  KVM state, and ordering of `prepare_save()` vs `transport_state.save()`).
+- `48a5ae3b2` — companion fix that moves vsock's `send_transport_reset_event`
+  into `prepare_save()` so it benefits from the (now correct) save ordering;
+  without this, vsock still has its own copy of the bug. Addresses
+  **Bug 9** below.
+
+| Branch | Bug 1 (lib.rs) | Bug 2 (MMIO) | Bug 3 (PCI) | Bug 9 (vsock) | Notes |
+|---|---|---|---|---|---|
+| `upstream/main` | fixed | fixed | fixed | fixed | `67ba7a206` + `48a5ae3b2` |
+| `upstream/firecracker-v1.15` | fixed | fixed | fixed | fixed | both backported |
+| `upstream/firecracker-v1.14` | **MISSING** | **MISSING** | **MISSING** | **MISSING** | last release v1.14.4 (2026-04-02) |
+| `upstream/firecracker-v1.12` | **MISSING** | **MISSING** | N/A (no PCI yet) | **MISSING** | |
+| `firecracker-v1.14-direct-mem` (PR #8) | **MISSING** | **MISSING** | **MISSING** | **MISSING** | This branch |
+| `firecracker-v1.12-direct-mem` (prod today) | **MISSING** | **MISSING** | N/A | **MISSING** | |
+
+Bugs 4–8 and 10 below are not addressed by either upstream fix and apply to
+all branches.
 
 ---
 
@@ -463,32 +473,199 @@ injected IRQs). Upstream doesn't do any of these today.
 
 ---
 
-### Bug 8 — Pending `queue_evt` count is lost across snapshot [M, scenario-bound]
+### Bug 8 — Pending `queue_evt` count is lost across snapshot [L, mitigated by resume_vm.kick]
 
 The ioeventfd backing virtio-mmio QueueNotify and virtio-pci notify writes is
 a per-VMM-process eventfd, owned by `VirtioBlock` and created fresh in
 `VirtioBlock::new` (at [`device.rs:311-314`][queue_evts]) and rebuilt fresh by
 `VirtioBlock::restore` (at [`persist.rs:99`][queue_evts_restore]). If the
 guest writes to QueueNotify and the VMM event loop has *not* yet drained that
-`queue_evt` count before pause + snapshot:
+`queue_evt` count before pause + snapshot, the host-side `next_avail` lags
+the guest-side `avail_ring->idx` and the fresh `queue_evt` is empty on the
+restored device.
 
-- The descriptor is in the avail ring in guest memory (preserved in memfile/
-  UFFD), but `queues[0].next_avail` (host-side, in the snapshot) still points
-  at the old position.
-- On restore, a fresh `queue_evt` is created — the pending count is lost.
-- Nothing triggers `process_queue` on the restored device → those descriptors
-  are read only if the guest sends another QueueNotify.
+**Mitigation found:** `Vmm::resume_vm()` calls
+`device_manager.kick_virtio_devices()` ([`lib.rs:386-388`][resume_kick]) which
+calls each VirtIO device's `kick()` trait method
+([`device_manager/mod.rs:278-301`][kick_dm]). For block,
+[`VirtioBlock`'s `kick`][block_kick] calls `process_virtio_queues()` which
+reads the avail ring from guest memory and processes anything it finds —
+including any descriptors the guest had written but never had a chance to
+notify about. So this scenario *does not freeze* the guest as long as
+`resume_vm` runs after the snapshot is loaded — which the orchestrator
+[does][infra-resume].
 
-In the orchestrator's current
-[`Sandbox.Pause` flow][infra-pause]
-this is dodged because `process.Pause` and `process.CreateSnapshot` are
-separate API calls — between them the VMM event loop runs and drains
-`queue_evt`. Filing for completeness: any future refactor that combines pause
-+ snapshot into a single VMM event handler (without yielding) would expose
-this.
+Initially filed as severity-M; downgrading to **L** because the kick path is
+defensive coverage for exactly this case (comment at
+[`device.rs:219-228`][block_kick]: "kick the block queue(s) to make up for
+any pending or in-flight epoll events we may have not captured in
+snapshot"). A future refactor that drops `resume_vm` (e.g. autoresume during
+load) would re-introduce the risk. See also **Bug 10** below — block's kick
+mitigates Bug 8 but does **not** mitigate Bug 1 / Bug 7.
 
 [queue_evts]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/device.rs#L312-L313
 [queue_evts_restore]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/persist.rs#L99
+[resume_kick]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/lib.rs#L386-L388
+[kick_dm]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/mod.rs#L278-L301
+[block_kick]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/device.rs#L219-L228
+[infra-resume]: https://github.com/e2b-dev/infra/blob/main/packages/orchestrator/pkg/sandbox/fc/process.go
+
+---
+
+### Bug 9 — vsock has the same ordering bug pattern; both upstream commits missing on this branch [C]
+
+[`src/vmm/src/device_manager/persist.rs:287-318`][vsock_mmio_save]
+
+```rust
+virtio_ids::VIRTIO_ID_VSOCK => {
+    let vsock = locked_device.as_mut_any()
+        .downcast_mut::<Vsock<VsockUnixBackend>>().unwrap();
+
+    // Send Transport event to reset connections if device
+    // is activated.
+    if vsock.is_activated() {
+        vsock.send_transport_reset_event().unwrap_or_else(|err| {     // <-- AFTER transport_state.save()
+            error!("Failed to send reset transport event: {:?}", err);
+        });
+    }
+
+    // Save state after potential notification to the guest. This
+    // way we save changes to the queue the notification can cause.
+    let device_state = VsockState { ... };
+    states.vsock_device = Some(VirtioDeviceState {
+        device_id, device_state,
+        transport_state /* <-- captured at L230, BEFORE the reset event */, device_info,
+    });
+}
+```
+
+`send_transport_reset_event` puts a `VIRTIO_VSOCK_EVENT_TRANSPORT_RESET` into
+the event virtqueue, advances the used ring, and calls `signal_used_queue(EVQ)
+→ trigger_irq(Vring) → irq_status.fetch_or(VIRTIO_MMIO_INT_VRING, …)` —
+see [`vsock/device.rs:259-281`][vsock_reset]. The transport `interrupt_status`
+captured at line 230 doesn't have that bit set.
+
+PCI has the same pattern at [`pci_mngr.rs:351-380`][vsock_pci_save] (also
+affects `msix_state` / PBA bits).
+
+The in-source comment ("Save state after potential notification … This way we
+save changes to the queue the notification can cause") is misleading — it
+covers the `device_state` save below, but **not** the `transport_state` which
+was already taken above. This bug predates the block bug; the upstream commit
+message of [`67ba7a206`][upstream-fix] explicitly says vsock was the only
+other device using `prepare_save`-style hooks but "doesn't modify VirtIO
+state, neither sends interrupts" — at the time it was written, that was true
+of vsock's `prepare_save` (which didn't exist for vsock yet), not of the
+device_manager-level reset call.
+
+**Two upstream commits are needed to fix this on PR #8**:
+
+1. [`67ba7a206`][upstream-fix] — establishes the contract that
+   `prepare_save()` runs *before* `transport_state.save()` (also fixes Bugs
+   1, 2, 3).
+2. [`48a5ae3b2`][upstream-vsock] — refactors vsock so that
+   `send_transport_reset_event` is moved into a new `Vsock::prepare_save()`,
+   which (post-fix #1) runs before `transport_state.save()`. The commit
+   adds a note in `vsock/device.rs` documenting the dependency on the kick
+   path for redundancy.
+
+**Mitigation today**: `Vsock::kick()`
+([`vsock/device.rs:382-393`][vsock_kick]) **unconditionally** re-fires
+`signal_used_queue(EVQ_INDEX)` on resume — unlike block's `kick`, this is a
+direct IRQ retrigger that does not depend on the avail ring containing
+anything. So in practice the guest receives the `TRANSPORT_RESET` IRQ on
+resume even with the bug present. This is fragile — it relies on (a)
+`resume_vm` being called, and (b) the guest re-arming its used-event such
+that the second trigger is delivered (notification-suppression-aware guests
+will see it).
+
+Connections to the host UDS are intentionally discarded across snapshot
+(comment at [`vsock/device.rs:382-388`][vsock_kick]: "Vsock has complicated
+protocol that isn't resilient to any packet loss"), so there's no half-open
+state to preserve. The fragility is purely about the reset event delivery.
+
+[vsock_mmio_save]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/persist.rs#L287-L318
+[vsock_pci_save]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/pci_mngr.rs#L351-L380
+[vsock_reset]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/vsock/device.rs#L259-L281
+[vsock_kick]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/vsock/device.rs#L382-L393
+
+---
+
+### Bug 10 — Block `kick()` doesn't re-fire an interrupt for already-completed used-ring entries [C, fixes blocked by Bug 1/7]
+
+Compare the two `kick()` implementations:
+
+`VirtioBlock::kick` ([`device.rs:219-228`][block_kick]):
+
+```rust
+fn kick(&mut self) {
+    // If device is activated, kick the block queue(s) to make up for any
+    // pending or in-flight epoll events we may have not captured in
+    // snapshot. No need to kick Ratelimiters
+    // because they are restored 'unblocked' so
+    // any inflight `timer_fd` events can be safely discarded.
+    if self.is_activated() {
+        info!("kick block {}.", self.id());
+        self.process_virtio_queues();
+    }
+}
+```
+
+`Vsock::kick` ([`vsock/device.rs:382-393`][vsock_kick]):
+
+```rust
+fn kick(&mut self) {
+    if self.is_activated() {
+        info!("kick vsock {}.", self.id());
+        self.signal_used_queue(EVQ_INDEX).unwrap();    // <-- unconditional IRQ retrigger
+    }
+}
+```
+
+Block's kick only drains the **avail** ring; if the avail ring is empty (no
+new descriptors since the snapshot), `process_virtio_queues` produces zero
+used-ring entries, `prepare_kick` returns false, and **no interrupt is
+triggered**. This is exactly the failure mode that Bug 1 (lost IRQ for
+already-processed descriptors) and Bug 7 (irqfd workqueue race) produce —
+new used-ring entries already in guest memory, IRQ never delivered, guest
+parked on the old descriptors waiting for completion.
+
+For vsock the equivalent failure is masked by the unconditional re-trigger.
+For block (which is the device the original PR #6 freeze test exercises)
+there is no such safety net, so even with Bugs 1, 2, 3 fixed via upstream
+backports, a separate Bug 7 occurrence at snapshot time can still freeze
+the guest. The robust answer would be for `VirtioBlock::kick` (and net's
+kick at [`net/device.rs:1062-1071`][net_kick]) to call `prepare_kick` on each
+queue and re-trigger the IRQ if there are unacked used-ring entries — i.e.
+mirror what vsock does. Filing as **C** because it's the residual hole that
+makes a coordinated Bug 1 / Bug 7 fix not fully sufficient on its own.
+
+[net_kick]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/net/device.rs#L1062-L1071
+
+---
+
+## Snapshot-related "kick" semantics — quick reference
+
+A single table of where IRQ retrigger does and doesn't happen on resume:
+
+| Device | `kick()` behavior | Recovers lost-IRQ class? |
+|---|---|---|
+| Block ([`device.rs:219-228`][block_kick]) | `process_virtio_queues()` — reads avail ring only | **No** — needs new descriptors to fire any IRQ |
+| Net ([`net/device.rs:1062-1071`][net_kick]) | `process_virtio_queues()` — reads RX+TX | **No** — same as block |
+| Vsock ([`vsock/device.rs:382-393`][vsock_kick]) | `signal_used_queue(EVQ)` — unconditional IRQ retrigger on EVQ | Yes (for EVQ only) |
+| Balloon ([`balloon/device.rs:1000-1008`][balloon_kick]) | replays queued FPH work via `process_virtio_queues` | **No** for IRQ; OK for FPH replay |
+| RNG/Entropy / PMem / virtio-mem | default `fn kick(&mut self) {}` (no-op) | **No** |
+
+[balloon_kick]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/balloon/device.rs#L1000-L1008
+
+This means the Bug 1 / Bug 7 class is **only** mitigated by:
+
+- (a) Correct ordering on the save side (upstream `67ba7a206` + `48a5ae3b2`),
+  and
+- (b) For irqfd's workqueue race (Bug 7), explicit kernel-state-drain logic
+  that doesn't exist anywhere in this tree.
+
+There is no resume-side safety net for block/net/RNG/PMem/virtio-mem.
 
 ---
 
@@ -503,6 +680,26 @@ To narrow the search space, the following were checked and are not bugs:
   to the avail ring via `queue.undo_pop()` and sets `is_io_engine_throttled`
   ([`device.rs:520-540`][throttle]). The completion path resets it
   ([`device.rs:674-687`][throttle_clear]). Sync vs Async paths agree.
+- **`is_io_engine_throttled` not persisted across snapshot.** Restored to
+  `false` ([`block/virtio/persist.rs:149`][throttle_persist]). This is
+  correct because the restored io_uring is empty (no throttling can apply)
+  *and* any descriptors that were undo_pop'd back to the avail ring will be
+  re-picked up by `resume_vm → kick → process_virtio_queues`. So no freeze.
+- **Rate-limiter blocked at snapshot is recovered on resume.** `RateLimiter`
+  state is persisted via `TokenBucketState { size, one_time_burst, refill_time,
+  budget, elapsed_ns }` ([`rate_limiter/persist.rs:11-50`][rl_persist]). On
+  restore the timerfd is rebuilt disarmed and `timer_active = false`
+  ([`rate_limiter/persist.rs:73-87`][rl_restore]). The `last_update` reflects
+  the snapshot-time elapsed-since-last-activity, so `auto_replenish` does the
+  right thing in restore-time coordinates (no "free bucket refill" exploit;
+  no over-replenishment). If the bucket was exhausted at snapshot, the first
+  `consume()` after restore fails and re-arms the timer; the
+  `process_rate_limiter_event` then re-fires `process_queue`. Combined with
+  `kick → process_virtio_queues` on resume, descriptors that were
+  rate-limit-throttled at snapshot time are eventually processed.
+  (Caveat: `OverConsumption` penalty timer state is not preserved, so a
+  one-time burst window may be slightly larger after restore than before.
+  Behavioural delta, not correctness.)
 - **Dirty memory tracking on reads** uses
   `WrappedRequest::new_with_dirty_tracking(addr, req)` at push time and
   `mark_dirty_mem_and_unwrap(mem, count)` at pop time
@@ -539,6 +736,9 @@ To narrow the search space, the following were checked and are not bugs:
 [nodrop]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/io_uring/mod.rs#L334-L346
 [throttle]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/device.rs#L520-L540
 [throttle_clear]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/device.rs#L674-L687
+[throttle_persist]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/persist.rs#L149
+[rl_persist]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/rate_limiter/persist.rs#L11-L50
+[rl_restore]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/rate_limiter/persist.rs#L73-L87
 [dirty]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs#L53-L67
 [dirty_pop]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs#L286-L299
 [queue_used]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/queue.rs#L557-L606
@@ -560,10 +760,16 @@ correctness during snapshot, which is what this document is about.
 
 ## References
 
-- Upstream fix:
-  [`firecracker-microvm/firecracker@67ba7a206`][upstream-fix]
-  ("fix: saving/restoring async IO engine transport state", 2025-12-15) and
-  its v1.15 backport [`48a5ae3b2`][upstream-vsock].
+- Upstream fixes (both required to fully cover the bugs catalogued here):
+  - [`firecracker-microvm/firecracker@67ba7a206`][upstream-fix]
+    ("fix: saving/restoring async IO engine transport state", 2025-12-15) —
+    addresses Bugs 1, 2, 3 by reordering `device_manager.save()` before KVM
+    state and `prepare_save()` before `transport_state.save()`.
+  - [`firecracker-microvm/firecracker@48a5ae3b2`][upstream-vsock]
+    ("refactor(vsock): Send reset event before saving transport state",
+    2026-02-16) — addresses Bug 9 by moving vsock's reset event into
+    `Vsock::prepare_save()` so it benefits from the new ordering. Depends
+    on the prior commit.
 - Freeze reproducer (closed):
   [`e2b-dev/firecracker#6`][pr6] (`test_snapshot_with_heavy_async_io`).
 - Current target branch:
