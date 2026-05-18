@@ -1,11 +1,20 @@
-# Async block I/O snapshot correctness analysis
+# Snapshot correctness analysis
 
-Read-only analysis of the async-engine (`io_uring`) virtio-block code path and
-how it interacts with snapshot save/restore. The goal is to enumerate every
-correctness issue that could cause the "post-resume guest freeze" originally
-reproduced by [`e2b-dev/firecracker#6`][pr6] (the `Freeze test reproduction`
-branch). **No fixes are proposed here — only findings, with links to every
-relevant source location.**
+Read-only analysis of snapshot save/restore correctness on
+[`e2b-dev/firecracker#8`][pr8]'s branch. Originally scoped to the async-engine
+(`io_uring`) virtio-block code path and the "post-resume guest freeze"
+reproduced by [`e2b-dev/firecracker#6`][pr6]; extended to cover the broader
+snapshot flow and the e2b-specific extensions on this branch (optional
+memfile, `/memory/mappings` API, UFFD WP, FPH balloon, MMDS, rate-limiter
+PATCH semantics, etc.). **No fixes are proposed here — only findings, with
+links to every relevant source location.**
+
+The document is in two parts:
+
+- **Findings 1–10**: the async-block snapshot freeze class and adjacent
+  device-state issues (vsock, kick semantics, irqfd race).
+- **Findings P2-1–P2-8**: broader snapshot-flow correctness in the
+  orchestrator's usage pattern, beyond async-block.
 
 [pr6]: https://github.com/e2b-dev/firecracker/pull/6
 
@@ -757,6 +766,358 @@ non-blocking `io_uring_enter` from `kick_submission_queue`
 ([`async_io.rs:250-255`][kick]), independent of in-flight depth. So the
 performance argument for async stands; the open question is purely
 correctness during snapshot, which is what this document is about.
+
+## Broader snapshot audit — beyond the async-block path
+
+The findings below come from a second-pass audit covering:
+
+- the e2b-specific snapshot extensions on this branch (`/memory/mappings`,
+  optional `mem_file_path`, UFFD WP),
+- the orchestrator's `Pause` / `Resume` flow
+  ([`infra::Sandbox.Pause`][infra-pause], [`fc::Process.Resume`][infra-resume]),
+- the non-async devices (vsock was covered in Bug 9; this pass adds balloon
+  FPH, MMDS, serial, ACPI, KVM-clock/TSC),
+- the rate-limiter PATCH semantics used by the orchestrator on resume.
+
+Same severity rubric as above.
+
+---
+
+### Finding P2-1 — Optional `mem_file_path = None` skips KVM dirty-log + region-bitmap reset [M, scenario-bound, diff-snapshot only]
+
+[`src/vmm/src/persist/mod.rs:159-181`][create_snapshot]:
+
+```rust
+snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
+
+if let Some(mem_file_path) = params.mem_file_path.as_ref() {
+    vmm.vm
+        .snapshot_memory_to_file(mem_file_path, params.snapshot_type, vmm.page_size)?;
+}
+
+// We need to mark queues as dirty again for all activated devices. …
+vmm.device_manager
+    .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
+```
+
+The `Vm::snapshot_memory_to_file` body
+[`vstate/vm.rs:335-395`][snapshot_mem] is what calls
+`reset_dirty_bitmap()` + `guest_memory().reset_dirty()` at
+[`vstate/vm.rs:385-389`][reset_dirty] for the `SnapshotType::Full` branch:
+
+```rust
+SnapshotType::Full => {
+    self.reset_dirty_bitmap();
+    self.guest_memory().reset_dirty();
+}
+```
+
+When the orchestrator passes `mem_file_path = None` (its production mode,
+since it extracts memory externally), `snapshot_memory_to_file` is skipped
+entirely, so **the dirty-state reset never runs**. The next diff snapshot
+in a chained workflow will then over-report dirty pages — pages that became
+dirty *before* the current snapshot will still be flagged dirty going into
+the *next* one.
+
+For Full snapshots in isolation this is benign. For chained
+template → diff → diff workflows (which `pauseProcessRootfs` /
+`pauseProcessMemory` in the orchestrator support) it inflates the diff
+footprint and can mis-represent which pages actually changed.
+
+[create_snapshot]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/persist/mod.rs#L159-L181
+[snapshot_mem]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/vstate/vm.rs#L335-L395
+[reset_dirty]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/vstate/vm.rs#L385-L389
+
+---
+
+### Finding P2-2 — `/memory/mappings` is not gated on `VmState::Paused` [M, contract gap]
+
+[`src/vmm/src/rpc_interface.rs:963-1010`][meminfo_rpc]:
+
+```rust
+fn get_guest_memory_mappings(&self) -> Result<VmmData, VmmActionError> {
+    // … no VmState::Paused check
+}
+
+fn get_guest_memory_info(&self) -> Result<VmmData, VmmActionError> {
+    let vmm = …;
+    if vmm.instance_info.state != VmState::Paused {                 // L981
+        return Err(…);
+    }
+    …
+}
+
+fn get_dirty_memory_info(&self) -> Result<VmmData, VmmActionError> {
+    let vmm = …;
+    if vmm.instance_info.state != VmState::Paused {                 // L1000
+        return Err(…);
+    }
+    …
+}
+```
+
+`GetMemory` and `GetMemoryDirty` correctly require paused; `GetMemoryMappings`
+doesn't. If the host-virtual addresses returned by `/memory/mappings` are
+later used to read memory **after** the vCPUs were resumed (or were never
+paused in the first place), the read will race with guest writes and produce
+torn data.
+
+The orchestrator currently calls these endpoints only after pause, so this
+is a contract bug, not an exploited one — but `/memory/mappings` is exactly
+the kind of API external tooling integrates against, and the missing gate
+makes it a footgun.
+
+[meminfo_rpc]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/rpc_interface.rs#L963-L1010
+
+---
+
+### Finding P2-3 — `/memory/mappings` layout disagrees with `dump()` when virtio-mem hotplug has unplugged slots [C, latent]
+
+Two layouts for "linear memfile offset" exist in this tree:
+
+A. [`src/vmm/src/lib.rs:701-724`][guest_mappings] — `guest_memory_mappings`
+   iterates `flat_map(|r| r.plugged_slots())` and accumulates `offset` by
+   plugged-slot size only.
+
+B. [`src/vmm/src/vstate/memory.rs:689-701`][dump_memory] —
+   `GuestMemoryExtension::dump` walks **all** slots; for unplugged slots it
+   only `seek`s the file forward, leaving zeroed holes.
+
+If virtio-mem is enabled and any slot in a region is unplugged, these two
+layouts diverge: the memfile produced by `dump()` has a hole at the unplugged
+slot position, but `/memory/mappings` reports a contiguous offset that
+collapses over the hole. External tooling that correlates the API output
+against the memfile (which is exactly what the orchestrator does in
+`pauseProcessMemory`) reads the wrong bytes for any region following the
+first hole.
+
+virtio-mem is not used by the orchestrator today, so this is latent. It
+becomes load-bearing the moment virtio-mem is turned on (which is on the
+roadmap, given that PR #13 already added virtio-block discard/write-zeroes).
+
+[guest_mappings]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/lib.rs#L701-L724
+[dump_memory]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/vstate/memory.rs#L689-L701
+
+---
+
+### Finding P2-4 — Empty `{}` rate-limiter PATCH does not clear snapshot-restored limits [M, orchestrator expectation mismatch]
+
+The orchestrator's [`fc/client.go:setTxRateLimit`][orch_setrl] documents:
+
+> Both buckets are disabled when their `BucketSize < 0`; if all are disabled
+> **an empty RateLimiter is sent to reset any limit persisted in a snapshot**.
+
+The Go model [`shared/pkg/fc/models/rate_limiter.go`][orch_rl_model] uses
+`json:"bandwidth,omitempty"` + `json:"ops,omitempty"`, so the empty case
+serializes as `{}` with **both fields omitted**.
+
+On the FC side, [`src/vmm/src/rpc_interface.rs:914-940`][fc_patch] only
+applies an update when `rate_limiter` is `Some`:
+
+```rust
+if new_cfg.rate_limiter.is_some() {
+    vmm.update_block_rate_limiter(
+        &new_cfg.drive_id,
+        RateLimiterUpdate::from(new_cfg.rate_limiter).bandwidth,
+        RateLimiterUpdate::from(new_cfg.rate_limiter).ops,
+    )
+```
+
+And [`src/vmm/src/vmm_config/mod.rs:96-115`][bucket_update] returns
+`BucketUpdate::None` for `tb_cfg: None`. So an empty `{}` JSON object on the
+wire produces `BandwidthUpdate::None` + `OpsUpdate::None` and **the
+snapshot-restored buckets are left untouched**. The orchestrator's "reset"
+path silently does nothing.
+
+Concrete consequence: if a snapshot was taken with a rate limiter and the
+new deployment configuration says "no limits", the restored sandbox still
+runs with the snapshot-era limits. The guest sees throttling that the
+operator believes they removed.
+
+[orch_setrl]: https://github.com/e2b-dev/infra/blob/main/packages/orchestrator/pkg/sandbox/fc/client.go
+[orch_rl_model]: https://github.com/e2b-dev/infra/blob/main/packages/shared/pkg/fc/models/rate_limiter.go
+[fc_patch]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/rpc_interface.rs#L914-L940
+[bucket_update]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/vmm_config/mod.rs#L96-L115
+
+---
+
+### Finding P2-5 — DrainBalloon timeout leaves `hinting_state` mid-protocol but restore force-resets `host_cmd` to DONE [L, scenario-bound]
+
+Orchestrator code wraps [`process.DrainBalloon`][orch_drain] in a per-use-case
+timeout; on timeout it logs and continues.
+
+`BalloonState.hinting_state` is persisted at
+[`balloon/persist.rs:100-135`][balloon_save] but `BalloonConfig.
+free_page_hint_cmd_id` is force-reset to `FREE_PAGE_HINT_DONE` on restore at
+[`balloon/persist.rs:180-210`][balloon_restore]:
+
+```rust
+let config = BalloonConfig {
+    …,
+    free_page_hint_cmd_id: FREE_PAGE_HINT_DONE,         // <-- always DONE on restore
+};
+…
+let mut balloon = Balloon::new(config, … )?;
+balloon.hinting_state = state.hinting_state;            // <-- but in-progress state preserved
+```
+
+So a snapshot taken while a hinting cycle was mid-chain restores with
+`hinting_state` saying "mid-chain" and `cmd_id` saying "done". Whether the
+guest driver gracefully handles that discrepancy depends on its
+implementation; the spec-compliant behavior is to ignore stale hint state
+when the cmd_id resets, but it's a delta worth noting.
+
+[orch_drain]: https://github.com/e2b-dev/infra/blob/main/packages/orchestrator/pkg/sandbox/fc/process.go
+[balloon_save]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/balloon/persist.rs#L100-L135
+[balloon_restore]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/balloon/persist.rs#L180-L210
+
+---
+
+### Finding P2-6 — MMDS data contents are not persisted across snapshot [L, race window]
+
+[`device_manager/persist.rs:119-123`][mmds_state]:
+
+```rust
+pub struct MmdsState {
+    pub version: MmdsVersion,
+    pub imds_compat: bool,
+}
+```
+
+Only `version` and `imds_compat` are saved. The actual IMDS JSON datastore
+(`Mmds::data_store`) is not in the snapshot. On restore,
+`set_mmds_basic_config` rebuilds an empty MMDS; the orchestrator calls
+`setMmds` only **after** `resumeVM` (see [`fc::Process.Resume`][infra-resume]
+~line 596+), so guests that read MMDS during the brief window between
+`resumeVM` and `setMmds` will see `NotInitialized` / empty content.
+
+No cross-sandbox leak (the previous MMDS body genuinely isn't there) —
+the issue is the "uninitialized for a few ms after resume" window for the
+new guest.
+
+[mmds_state]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/persist.rs#L119-L123
+[infra-resume]: https://github.com/e2b-dev/infra/blob/main/packages/orchestrator/pkg/sandbox/fc/process.go
+
+---
+
+### Finding P2-7 — Serial (aarch64) state is only partially persisted; the `IER_RDA` workaround is the only mitigation [L, documented]
+
+[`device_manager/persist.rs:211-226`][serial_save] saves only `DeviceType` +
+`MMIODeviceInfo` (address, length, gsi). UART FIFO contents, IER, LCR,
+output rate-limiter (if any) are not persisted.
+
+[`device_manager/mod.rs:495-540`][serial_init] documents an explicit
+workaround (`emulate_serial_init`) that sets `IER_RDA` after restore to
+re-enable RX interrupts. The serial output rate-limiter commit
+[`9a49dcb03`][serial_rl] is **not** an ancestor of this branch, so the
+rate-limiter persistence question doesn't apply here yet — but if it lands,
+it inherits the same "rate-limiter timerfd disarmed on restore" pattern
+discussed under Bug 5.
+
+[serial_save]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/persist.rs#L211-L226
+[serial_init]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/mod.rs#L495-L540
+[serial_rl]: https://github.com/firecracker-microvm/firecracker/commit/9a49dcb03
+
+---
+
+### Finding P2-8 — `SIGTERM` during `CreateSnapshot` can leave a truncated snapshot file [L, scenario-bound]
+
+Orchestrator [`process.Stop`][orch_stop] sends `SIGTERM`, then `SIGKILL`
+after 10s. `snapshot_state_to_file` at
+[`src/vmm/src/persist/mod.rs:184-203`][snapshot_state_write] opens the
+snapfile with `OpenOptions::create + truncate + write`, then `flush` +
+`sync_all`. If a SIGTERM lands between `truncate` and `sync_all`, the file
+on disk is a syntactically invalid blob.
+
+Concretely, this is only reachable if something in the snapshot pipeline
+calls `Stop` while `CreateSnapshot` is in flight — which is not the
+happy path, but is reachable from context cancellation chains during
+pause-related errors. The reload-side `snapshot_state_from_file` does
+strict version + format validation so a partial file will be rejected on
+restore (failure rather than silent corruption), but cleanup of the
+truncated file is the operator's problem.
+
+[orch_stop]: https://github.com/e2b-dev/infra/blob/main/packages/orchestrator/pkg/sandbox/fc/process.go
+[snapshot_state_write]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/persist/mod.rs#L184-L203
+
+---
+
+## What I verified is correct — broader audit
+
+These are checks I did during the second pass that are not bugs and are
+unlikely to need attention; documenting them so they don't get rediscovered.
+
+- **`FlushMetrics` between `Pause` and `CreateSnapshot` is safe** — it only
+  writes metrics, does not re-enter the virtio loop
+  ([`rpc_interface.rs:851-858`][flush_metrics]). The orchestrator's
+  `Sandbox.Pause` calls it between pause and snapshot deliberately.
+- **Snapshot version validation is strict** — only major.minor `(8,0)`,
+  `(6,0)`, `(4,0)` accepted, hard fail otherwise
+  ([`persist/mod.rs:460-478`][snap_version]).
+- **VMGenID generates a fresh random 128-bit ID on every restore** — not
+  replayed from snapshot ([`vmgenid.rs:46-62`][vmgenid_make]). Each
+  restored sandbox gets a unique generation ID; the crypto/RNG-reseeding
+  contract holds.
+- **TSC freq scaling + restore ordering** —
+  [`builder.rs:462-482`][builder_tsc] calls `set_tsc_khz` on each vCPU
+  before its `restore_state`, on the VMM thread, before any vCPU thread
+  runs. No race.
+- **`cc4bef8b2` (kvm-clock no-monotonic-jump fix) is correctly wired on
+  this branch** — clock flags only carry `KVM_CLOCK_REALTIME` when the
+  load request opts in ([`arch/x86_64/vm.rs:128-150`][vm_clock]).
+- **UFFD WP registration happens before device restore.**
+  `guest_memory_from_uffd` runs in `restore_from_snapshot` before
+  `build_microvm_from_snapshot`; device-restore-induced writes can't race
+  with WP setup.
+- **`mark_virtio_queue_memory_dirty` after snapshot is safe.** It does not
+  rewrite guest bytes — only marks Firecracker's bitmap for the next diff
+  ([`device_manager/mod.rs:303-329`][mark_dirty],
+  [`queue.rs:335-371`][queue_init]).
+- **Rootfs symlink dance is correctly sequenced.** The `/dev/null`
+  symlink at `SandboxCacheRootfsLinkPath` is overwritten with the real
+  rootfs before `loadSnapshot` is called — `fc::Process.Resume` gates
+  `loadSnapshot` behind an `errgroup.Wait()` that includes the symlink
+  step (see [`fc::Process.Resume`][infra-resume]).
+- **IoEngine type matches save → restore.** The orchestrator's `Resume`
+  path does not call `setRootfsDrive`, so the engine type comes only from
+  `VirtioBlockState.file_engine_type` restored from the snapshot.
+- **VMGenID restore IRQ ordering vs KVM state.**
+  `DeviceManager::restore` runs after `vm.restore_state` on x86_64
+  ([`builder.rs:494-517`][builder_restore]); so the gsi-registered irqfd
+  writes hit a fully-restored KVM IRQ chip. The comment at
+  `builder.rs:497-510` is accurate. **No other device's `Persist::restore`
+  injects IRQs**, so this is the only constraint.
+- **`shared_mem` is not present in this tree.** No `MAP_SHARED` for the
+  main guest memory mapping is implemented behind a `shared_mem` flag on
+  PR #8. The only `MAP_SHARED` path is the existing `memfd_backed` route.
+
+[flush_metrics]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/rpc_interface.rs#L851-L858
+[snap_version]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/persist/mod.rs#L460-L478
+[vmgenid_make]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/acpi/vmgenid.rs#L46-L62
+[builder_tsc]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/builder.rs#L462-L482
+[vm_clock]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/arch/x86_64/vm.rs#L128-L150
+[mark_dirty]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/mod.rs#L303-L329
+[queue_init]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/queue.rs#L335-L371
+[builder_restore]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/builder.rs#L494-L517
+
+---
+
+## Cosmetic / API drift (not bugs)
+
+- **`meminfo.rs` doc comment** claims mappings are "guest physical to host
+  virtual" but the payload is host VA + size + linear-backend offset +
+  page size (guest PA only implied by correlating against
+  `MicrovmState.vm_state.memory.regions`). Misleading docstring.
+- **Swagger `/memory/mappings` description** mentions a "skippable pages
+  bitmap" in the summary but the response schema only contains `mappings`.
+- **`GuestRegionUffdMapping`** includes a deprecated `page_size_kib` field
+  in the Rust struct that the swagger schema omits — strict JSON clients
+  could choke on the extra field.
+
+These are independent of the snapshot-correctness work; just leaving the
+flag here so we don't keep rediscovering them.
+
+---
 
 ## References
 
