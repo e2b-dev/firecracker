@@ -11,12 +11,16 @@ links to every relevant source location.**
 
 The document is in two parts:
 
-- **Findings 1–10**: the async-block snapshot freeze class and adjacent
-  device-state issues (vsock, kick semantics, irqfd race).
+- **Findings 4–10**: the async-block snapshot freeze class and adjacent
+  device-state issues (vsock, kick semantics, irqfd race). Findings 1, 2, 3
+  (the upstream ordering bugs) were addressed by [`639196c95`][fix-639]
+  ("fix: saving/restoring async IO engine transport state", cherry-pick of
+  upstream `67ba7a206`) and have been removed from this document.
 - **Findings P2-1–P2-8**: broader snapshot-flow correctness in the
   orchestrator's usage pattern, beyond async-block.
 
 [pr6]: https://github.com/e2b-dev/firecracker/pull/6
+[fix-639]: https://github.com/e2b-dev/firecracker/commit/639196c9548302bb62b52629e82c6ea6f54c4710
 
 ## Scope
 
@@ -24,11 +28,13 @@ The document is in two parts:
   open [`e2b-dev/firecracker#8`][pr8] ("[v1.14] Expose memory mapping & dirty
   pages; Make memfile dump optional"). This is the branch the orchestrator
   is going to consume next.
-- Baseline commit at time of writing: [`f0a35a156`][head] (
-  `docs(balloon): document WAIT_ON_ACK feature`). All file links below are
-  pinned to that SHA so they don't bitrot if the branch advances.
+- Baseline commit: [`639196c95`][head] (the upstream ordering-fix
+  cherry-pick). All file links below are pinned to that SHA so they don't
+  bitrot if the branch advances.
 - Active branch used in production today: [`firecracker-v1.12-direct-mem`][br112]
-  — same root causes apply, see [Per-branch backport status](#per-branch-backport-status).
+  — same root causes apply, **including the now-fixed ordering bugs**, since
+  the v1.12 branch has not received the cherry-pick yet. See
+  [Per-branch backport status](#per-branch-backport-status).
 - Downstream consumer: the orchestrator's snapshot path in
   [`e2b-dev/infra`][infra-pause]
   (`packages/orchestrator/pkg/sandbox/sandbox.go::Sandbox.Pause`) which calls
@@ -37,7 +43,7 @@ The document is in two parts:
 [br]: https://github.com/e2b-dev/firecracker/tree/firecracker-v1.14-direct-mem
 [br112]: https://github.com/e2b-dev/firecracker/tree/firecracker-v1.12-direct-mem
 [pr8]: https://github.com/e2b-dev/firecracker/pull/8
-[head]: https://github.com/e2b-dev/firecracker/tree/f0a35a156
+[head]: https://github.com/e2b-dev/firecracker/tree/639196c95
 [infra-pause]: https://github.com/e2b-dev/infra/blob/main/packages/orchestrator/pkg/sandbox/sandbox.go
 
 ## Background
@@ -54,36 +60,39 @@ relative to the kernel.
 snapshot-resume when async block I/O is heavy at pause time. The
 [upstream fix][upstream-fix] (`67ba7a206`, "fix: saving/restoring async IO
 engine transport state", 2025-12-15) addressed three ordering bugs in the
-save path. That fix is on `upstream/main` and was backported to
-`upstream/firecracker-v1.15` as [`48a5ae3b2`][upstream-vsock]; it was **never
-backported to `upstream/firecracker-v1.14` or `upstream/firecracker-v1.12`**,
-and the e2b fork inherits that gap.
+save path. That fix was cherry-picked onto PR #8 as [`639196c95`][fix-639]
+during the lifetime of this audit, so Findings 1, 2, 3 are no longer present
+on this branch. The cherry-pick does **not** include the upstream companion
+commit [`48a5ae3b2`][upstream-vsock] ("refactor(vsock): Send reset event
+before saving transport state"), which is still required to address
+**Bug 9** below.
 
 [upstream-fix]: https://github.com/firecracker-microvm/firecracker/commit/67ba7a20692a5d1a2fd9218523a9b3ccde9e4a37
 [upstream-vsock]: https://github.com/firecracker-microvm/firecracker/commit/48a5ae3b2
 
-## Save-path call chain (where the bugs live)
+## Save-path call chain
 
-The save side of `CreateSnapshot` walks roughly like this on PR #8 head:
+The save side of `CreateSnapshot` walks roughly like this on PR #8 head
+**after** the [`639196c95`][fix-639] cherry-pick:
 
 | Step | Symbol | Source |
 |---|---|---|
 | 1 | `pub fn create_snapshot(vmm, vm_info, params)` | [`src/vmm/src/persist/mod.rs:159-182`][create_snapshot] |
-| 2 | `Vmm::save_state(vm_info)` | [`src/vmm/src/lib.rs:444-471`][save_state] |
-| 3 | `save_vcpu_states()` (KVM_GET_LAPIC, KVM_GET_VCPU_EVENTS, …) | [`src/vmm/src/lib.rs:447`][save_state] / [`src/vmm/src/arch/x86_64/vcpu.rs:555-614`][vcpu_save] |
-| 4 | `self.kvm.save_state()` (KVM_GET_IRQCHIP) | [`src/vmm/src/lib.rs:448`][save_state] |
-| 5 | `self.vm.save_state()` | [`src/vmm/src/lib.rs:449-460`][save_state] |
-| 6 | `self.device_manager.save()` → per-transport `transport_state.save()` + per-device `block.prepare_save()` + `block.save()` | [`src/vmm/src/lib.rs:461`][save_state] |
+| 2 | `Vmm::save_state(vm_info)` | [`src/vmm/src/lib.rs:444-475`][save_state] |
+| 3 | `self.device_manager.save()` (now FIRST) → per-device `prepare_save()` → per-transport `transport_state.save()` → device `save()` | [`src/vmm/src/lib.rs:451`][save_state] |
+| 4 | `save_vcpu_states()` (KVM_GET_LAPIC, KVM_GET_VCPU_EVENTS, …) | [`src/vmm/src/lib.rs:452`][save_state] / [`src/vmm/src/arch/x86_64/vcpu.rs:555-614`][vcpu_save] |
+| 5 | `self.kvm.save_state()` (KVM_GET_IRQCHIP) | [`src/vmm/src/lib.rs:453`][save_state] |
+| 6 | `self.vm.save_state()` | [`src/vmm/src/lib.rs:454-465`][save_state] |
 | 7 | `VirtioBlock::prepare_save()` (only when activated): `drain_and_flush(false)` → `process_async_completion_queue()` | [`src/vmm/src/devices/virtio/block/virtio/device.rs:730-740`][prepare_save] |
 | 8 | `AsyncFileEngine::drain_and_flush(false)` → `drain(false)` (submit + wait) + `file.sync_all()` | [`src/vmm/src/devices/virtio/block/virtio/io/async_io.rs:271-280`][drain_flush] |
 | 9 | `process_async_completion_queue()` pops every CQE, `queue.add_used(...)`, `interrupt.trigger(Queue(0))` | [`src/vmm/src/devices/virtio/block/virtio/device.rs:575-624`][completion] |
 
-[create_snapshot]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/persist/mod.rs#L159-L182
-[save_state]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/lib.rs#L444-L471
-[vcpu_save]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/arch/x86_64/vcpu.rs#L555-L614
-[prepare_save]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/device.rs#L730-L740
-[drain_flush]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs#L271-L280
-[completion]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/device.rs#L575-L624
+[create_snapshot]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/persist/mod.rs#L159-L182
+[save_state]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/lib.rs#L444-L471
+[vcpu_save]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/arch/x86_64/vcpu.rs#L555-L614
+[prepare_save]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/virtio/device.rs#L730-L740
+[drain_flush]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs#L271-L280
+[completion]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/virtio/device.rs#L575-L624
 
 The interrupt actually delivered to KVM goes through one of:
 
@@ -94,8 +103,8 @@ The interrupt actually delivered to KVM goes through one of:
   — sets PBA bit if masked, otherwise writes the MSI-X eventfd:
   [`src/vmm/src/devices/virtio/transport/pci/device.rs:669-697`][pci_trigger]
 
-[mmio_trigger]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/transport/mmio.rs#L405-L477
-[pci_trigger]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/transport/pci/device.rs#L669-L697
+[mmio_trigger]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/transport/mmio.rs#L405-L477
+[pci_trigger]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/transport/pci/device.rs#L669-L697
 
 The transport state captured into the snapshot lives in:
 
@@ -106,8 +115,8 @@ The transport state captured into the snapshot lives in:
   (which holds the masked / PBA bits) at
   [`src/vmm/src/devices/virtio/transport/pci/device.rs:614-639`][pci_state].
 
-[mmio_state]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/persist.rs#L195-L233
-[pci_state]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/transport/pci/device.rs#L614-L639
+[mmio_state]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/persist.rs#L195-L233
+[pci_state]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/transport/pci/device.rs#L614-L639
 
 ---
 
@@ -121,147 +130,26 @@ can corrupt or hang under stress / signals; **L** = low / cosmetic.
 
 Two distinct upstream commits are involved:
 
-- `67ba7a206` — main fix for Bugs 1, 2, 3 (ordering of `device_manager.save()` vs
-  KVM state, and ordering of `prepare_save()` vs `transport_state.save()`).
+- `67ba7a206` — main ordering fix (`device_manager.save()` before KVM state,
+  `prepare_save()` before `transport_state.save()`). **Cherry-picked onto
+  PR #8 as [`639196c95`][fix-639] — Findings 1, 2, 3 are now closed on this
+  branch.**
 - `48a5ae3b2` — companion fix that moves vsock's `send_transport_reset_event`
   into `prepare_save()` so it benefits from the (now correct) save ordering;
   without this, vsock still has its own copy of the bug. Addresses
-  **Bug 9** below.
+  **Bug 9** below. **Not yet applied to PR #8.**
 
-| Branch | Bug 1 (lib.rs) | Bug 2 (MMIO) | Bug 3 (PCI) | Bug 9 (vsock) | Notes |
-|---|---|---|---|---|---|
-| `upstream/main` | fixed | fixed | fixed | fixed | `67ba7a206` + `48a5ae3b2` |
-| `upstream/firecracker-v1.15` | fixed | fixed | fixed | fixed | both backported |
-| `upstream/firecracker-v1.14` | **MISSING** | **MISSING** | **MISSING** | **MISSING** | last release v1.14.4 (2026-04-02) |
-| `upstream/firecracker-v1.12` | **MISSING** | **MISSING** | N/A (no PCI yet) | **MISSING** | |
-| `firecracker-v1.14-direct-mem` (PR #8) | **MISSING** | **MISSING** | **MISSING** | **MISSING** | This branch |
-| `firecracker-v1.12-direct-mem` (prod today) | **MISSING** | **MISSING** | N/A | **MISSING** | |
+| Branch | Ordering fix (`67ba7a206`) | Vsock fix (`48a5ae3b2`) — i.e. **Bug 9** |
+|---|---|---|
+| `upstream/main` | fixed | fixed |
+| `upstream/firecracker-v1.15` | fixed | fixed |
+| `upstream/firecracker-v1.14` | **MISSING** | **MISSING** |
+| `upstream/firecracker-v1.12` | **MISSING** | **MISSING** |
+| `firecracker-v1.14-direct-mem` (PR #8) | **fixed** by `639196c95` | **MISSING** ← still needs cherry-pick |
+| `firecracker-v1.12-direct-mem` (prod today) | **MISSING** ← needs backport | **MISSING** |
 
-Bugs 4–8 and 10 below are not addressed by either upstream fix and apply to
-all branches.
-
----
-
-### Bug 1 — `Vmm::save_state` saves KVM state **before** device state [C]
-
-[`src/vmm/src/lib.rs:444-471`][save_state]
-
-```rust
-pub fn save_state(&mut self, vm_info: &VmInfo) -> Result<MicrovmState, MicrovmStateError> {
-    use self::MicrovmStateError::SaveVmState;
-    let vcpu_states = self.save_vcpu_states()?;     // KVM_GET_LAPIC, KVM_GET_VCPU_EVENTS, …
-    let kvm_state = self.kvm.save_state();           // KVM_GET_IRQCHIP
-    let vm_state = { /* arch-specific VM state */ };
-    let device_states = self.device_manager.save();  // <-- prepare_save() runs here, TOO LATE
-    Ok(MicrovmState { vm_info: vm_info.clone(), kvm_state, vm_state, vcpu_states, device_states })
-}
-```
-
-`device_manager.save()` is the only caller of `VirtioBlock::prepare_save()`,
-which (a) drains `io_uring`, (b) writes completed entries into the used ring,
-and (c) calls `interrupt.trigger(VirtioInterruptType::Queue(0))` — see step 9
-above. The IRQ delivery path for both transports writes to an eventfd that
-KVM uses to pend an interrupt in the IRQ chip / LAPIC. By that time, **steps 3
-and 4 have already taken `KVM_GET_LAPIC` / `KVM_GET_VCPU_EVENTS` /
-`KVM_GET_IRQCHIP`**, so the just-triggered IRQ is not in the snapshot.
-
-On restore, the guest sees new used-ring entries (those *are* in guest memory
-and therefore in the memfile/UFFD) but the IRQ that was supposed to tell it
-"go look" is gone. Linux's virtio_blk waits on that IRQ in
-`submit_bio`/`blk_mq_*`, so it sleeps forever. This matches the symptom in
-[`PR #6`][pr6] and the [upstream fix commit message][upstream-fix].
-
-**Upstream fix:** move `let device_states = self.device_manager.save();` to be
-the first line in `save_state`. See upstream `lib.rs` on
-[`firecracker-v1.15`][upstream-v115-save] for the corrected ordering and the
-comment explaining it.
-
-[upstream-v115-save]: https://github.com/firecracker-microvm/firecracker/blob/firecracker-v1.15/src/vmm/src/lib.rs
-
----
-
-### Bug 2 — MMIO transport state captured **before** `prepare_save` runs [C]
-
-[`src/vmm/src/device_manager/persist.rs:228-267`][mmio_dm]
-
-```rust
-let _: Result<(), ()> = self.for_each_virtio_device(|_, devid, device| {
-    let mmio_transport_locked = device.inner.lock().expect("Poisoned lock");
-    let transport_state = mmio_transport_locked.save();    // <-- L230, captures irq_status NOW
-    let device_info = device.resources;
-    let device_id = devid.clone();
-
-    let mut locked_device = mmio_transport_locked.locked_device();
-    match locked_device.device_type() {
-        ...
-        virtio_ids::VIRTIO_ID_BLOCK => {
-            let block = locked_device.as_mut_any().downcast_mut::<Block>().unwrap();
-            if block.is_vhost_user() { … } else {
-                block.prepare_save();                       // <-- L258, mutates irq_status
-                let device_state = block.save();
-                states.block_devices.push(VirtioDeviceState {
-                    device_id, device_state, transport_state /* L263, stale */, device_info,
-                });
-            }
-        }
-```
-
-`MmioTransportState` includes `interrupt_status` (the `VIRTIO_MMIO_INT_VRING`
-bit) — see [`src/vmm/src/devices/virtio/persist.rs:195-233`][mmio_state] —
-which `prepare_save → process_async_completion_queue → trigger_irq(Vring)`
-sets via `irq_status.fetch_or(VIRTIO_MMIO_INT_VRING, …)`
-([`src/vmm/src/devices/virtio/transport/mmio.rs:464-477`][mmio_trigger]).
-
-Saving `transport_state` *before* `prepare_save` means the snapshot records
-`interrupt_status == 0` even though new used-ring entries are present. The
-Linux virtio-mmio ISR reads `InterruptStatus` (offset `0x60`), sees `0`, and
-returns `IRQ_NONE` without scanning the used ring.
-
-[mmio_dm]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/persist.rs#L228-L267
-
-**Upstream fix:** invert the order — call `prepare_save()` (or its
-`VirtioDevice` trait equivalent) before reading `mmio_transport_locked.save()`.
-
----
-
-### Bug 3 — PCI transport state captured **before** `prepare_save` runs [C]
-
-[`src/vmm/src/device_manager/pci_mngr.rs:284-328`][pci_dm]
-
-```rust
-for pci_dev in self.virtio_devices.values() {
-    let locked_pci_dev = pci_dev.lock().expect("Poisoned lock");
-    let transport_state = locked_pci_dev.state();          // <-- L286, captures msix_state NOW
-    let virtio_dev = locked_pci_dev.virtio_device();
-    let mut locked_virtio_dev = virtio_dev.lock().expect("Poisoned lock");
-    ...
-    virtio_ids::VIRTIO_ID_BLOCK => {
-        let block_dev = locked_virtio_dev.as_mut_any().downcast_mut::<Block>().unwrap();
-        if block_dev.is_vhost_user() { … } else {
-            block_dev.prepare_save();                       // <-- L319, may set PBA bit
-            let device_state = block_dev.save();
-            state.block_devices.push(VirtioDeviceState {
-                device_id: block_dev.id().to_string(), pci_device_bdf,
-                device_state, transport_state /* L325, stale */,
-            });
-        }
-    }
-```
-
-Same shape as Bug 2, on the PCI side. `prepare_save →
-process_async_completion_queue → trigger(Queue(0))` enters
-[`VirtioInterruptMsix::trigger`][pci_trigger] which, for the masked-vector
-path, calls `config.set_pba_bit(vector, false)`. That PBA bit lives in
-`MsixConfig` and is captured into `msix_state` by `VirtioPciDevice::state()`.
-Saving `transport_state` before `prepare_save` loses any PBA bit set there.
-
-The unmasked path writes the MSI-X eventfd, hitting the same race against
-KVM as Bug 1 (see also Bug 7 below).
-
-In production today PR #8 boots with `pci=off` so the MMIO path (Bug 2) is the
-one that fires; this bug becomes load-bearing the moment PCI is turned on.
-
-[pci_dm]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/pci_mngr.rs#L284-L328
+Findings 4–8 and 10 below are not addressed by either upstream fix and apply
+to all branches (including PR #8 post-cherry-pick).
 
 ---
 
@@ -306,13 +194,13 @@ which in turn invokes one `io_uring_enter` syscall at
   blk_mq tag is never returned → permanent in-kernel hang on that request →
   often a hang on *every* subsequent request once tag tracking diverges.
 
-This is the same external symptom as Bug 1 but the proximate cause is
-different — fixing the ordering bugs does not fix this. The
-[PR #6][pr6] test branch began addressing it by introducing a
+This produces the same external symptom as the (now-fixed) ordering bugs,
+but the proximate cause is different — fixing the ordering does not fix
+this. The [PR #6][pr6] test branch began addressing it by introducing a
 `PendingAsyncOperations(u32)` error variant; that change is not present on
 PR #8.
 
-[submit_syscall]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/io_uring/queue/submission.rs#L122-L153
+[submit_syscall]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/io_uring/queue/submission.rs#L122-L153
 
 Sub-issues bundled here:
 
@@ -333,7 +221,7 @@ Sub-issues bundled here:
   debug log.
 
 [pr11]: https://github.com/e2b-dev/firecracker/pull/11
-[num_ops]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/io_uring/mod.rs#L240-L244
+[num_ops]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/io_uring/mod.rs#L240-L244
 
 ---
 
@@ -407,10 +295,10 @@ Worth flagging in any future bug-4 hardening PR that also wants
 (There are also similar `cqe_result` matches in the e2b-discard path at
 [`device.rs:620-668`][eopnotsupp] for `WriteZeroes`.)
 
-[eopnotsupp]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/device.rs#L590-L668
+[eopnotsupp]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/virtio/device.rs#L590-L668
 
-[cqe]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/io_uring/operation/cqe.rs#L25-L40
-[cqe_test]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/io_uring/operation/cqe.rs#L60-L79
+[cqe]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/io_uring/operation/cqe.rs#L25-L40
+[cqe_test]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/io_uring/operation/cqe.rs#L60-L79
 
 ---
 
@@ -449,15 +337,16 @@ Two related sub-issues:
    [`async_io.rs:250-255`][kick]) issues `io_uring_enter` with no `EINTR`
    retry. Same flavor as Bug 4, in the steady-state path.
 
-[process_queue]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/device.rs#L494-L570
-[kick]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs#L250-L255
+[process_queue]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/virtio/device.rs#L494-L570
+[kick]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs#L250-L255
 
 ---
 
 ### Bug 7 — irqfd injection race with KVM state save [C-leaning M, not fixed by upstream]
 
-Even with Bugs 1–3 fixed (i.e. device save runs first), the IRQ that
-`prepare_save → trigger` produces is delivered to KVM **asynchronously**:
+Even with the ordering bugs fixed by `639196c95` (device save runs first),
+the IRQ that `prepare_save → trigger` produces is delivered to KVM
+**asynchronously**:
 
 - MMIO: `IrqTrigger::trigger_irq` writes to `irq_evt` which is registered with
   KVM as an irqfd. For legacy/level IRQs, KVM's irqfd path uses a kernel
@@ -472,7 +361,8 @@ Even with Bugs 1–3 fixed (i.e. device save runs first), the IRQ that
 
 Under heavy I/O + snapshot stress (which is exactly the workload PR #6
 exercises), this window is observably non-zero and produces the same
-external symptom as Bug 1.
+external symptom (lost IRQ → guest stuck in `submit_bio`) that the
+ordering fix targeted, but via a different mechanism.
 
 There is no explicit "drain irqfd workqueue" before `save_vcpu_states` / 
 `kvm.save_state`. Three known shapes for a fix exist (write+read companion
@@ -506,22 +396,22 @@ notify about. So this scenario *does not freeze* the guest as long as
 
 Initially filed as severity-M; downgrading to **L** because the kick path is
 defensive coverage for exactly this case (comment at
-[`device.rs:219-228`][block_kick]: "kick the block queue(s) to make up for
+[`device.rs:212-222`][block_kick]: "kick the block queue(s) to make up for
 any pending or in-flight epoll events we may have not captured in
 snapshot"). A future refactor that drops `resume_vm` (e.g. autoresume during
 load) would re-introduce the risk. See also **Bug 10** below — block's kick
-mitigates Bug 8 but does **not** mitigate Bug 1 / Bug 7.
+mitigates Bug 8 but does **not** mitigate Bug 7.
 
-[queue_evts]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/device.rs#L312-L313
-[queue_evts_restore]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/persist.rs#L99
-[resume_kick]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/lib.rs#L386-L388
-[kick_dm]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/mod.rs#L278-L301
-[block_kick]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/device.rs#L219-L228
+[queue_evts]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/virtio/device.rs#L312-L313
+[queue_evts_restore]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/virtio/persist.rs#L99
+[resume_kick]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/lib.rs#L386-L388
+[kick_dm]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/device_manager/mod.rs#L278-L301
+[block_kick]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/device.rs#L219-L228
 [infra-resume]: https://github.com/e2b-dev/infra/blob/main/packages/orchestrator/pkg/sandbox/fc/process.go
 
 ---
 
-### Bug 9 — vsock has the same ordering bug pattern; both upstream commits missing on this branch [C]
+### Bug 9 — vsock has the same ordering bug pattern; companion upstream commit still missing [C]
 
 [`src/vmm/src/device_manager/persist.rs:287-318`][vsock_mmio_save]
 
@@ -567,16 +457,18 @@ state, neither sends interrupts" — at the time it was written, that was true
 of vsock's `prepare_save` (which didn't exist for vsock yet), not of the
 device_manager-level reset call.
 
-**Two upstream commits are needed to fix this on PR #8**:
+**Two upstream commits are needed in series**:
 
 1. [`67ba7a206`][upstream-fix] — establishes the contract that
-   `prepare_save()` runs *before* `transport_state.save()` (also fixes Bugs
-   1, 2, 3).
+   `prepare_save()` runs *before* `transport_state.save()`. **Already
+   applied to PR #8 as [`639196c95`][fix-639].**
 2. [`48a5ae3b2`][upstream-vsock] — refactors vsock so that
    `send_transport_reset_event` is moved into a new `Vsock::prepare_save()`,
    which (post-fix #1) runs before `transport_state.save()`. The commit
    adds a note in `vsock/device.rs` documenting the dependency on the kick
-   path for redundancy.
+   path for redundancy. **Still missing on PR #8.** As verified by
+   `grep "fn prepare_save" src/vmm/src/devices/virtio/vsock/device.rs` →
+   empty.
 
 **Mitigation today**: `Vsock::kick()`
 ([`vsock/device.rs:382-393`][vsock_kick]) **unconditionally** re-fires
@@ -593,18 +485,18 @@ Connections to the host UDS are intentionally discarded across snapshot
 protocol that isn't resilient to any packet loss"), so there's no half-open
 state to preserve. The fragility is purely about the reset event delivery.
 
-[vsock_mmio_save]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/persist.rs#L287-L318
-[vsock_pci_save]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/pci_mngr.rs#L351-L380
-[vsock_reset]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/vsock/device.rs#L259-L281
-[vsock_kick]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/vsock/device.rs#L382-L393
+[vsock_mmio_save]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/device_manager/persist.rs#L287-L318
+[vsock_pci_save]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/device_manager/pci_mngr.rs#L351-L380
+[vsock_reset]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/vsock/device.rs#L259-L281
+[vsock_kick]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/vsock/device.rs#L382-L393
 
 ---
 
-### Bug 10 — Block `kick()` doesn't re-fire an interrupt for already-completed used-ring entries [C, fixes blocked by Bug 1/7]
+### Bug 10 — Block `kick()` doesn't re-fire an interrupt for already-completed used-ring entries [C, fixes blocked by Bug 7]
 
 Compare the two `kick()` implementations:
 
-`VirtioBlock::kick` ([`device.rs:219-228`][block_kick]):
+`VirtioBlock::kick` ([`device.rs:212-222`][block_kick]):
 
 ```rust
 fn kick(&mut self) {
@@ -634,22 +526,21 @@ fn kick(&mut self) {
 Block's kick only drains the **avail** ring; if the avail ring is empty (no
 new descriptors since the snapshot), `process_virtio_queues` produces zero
 used-ring entries, `prepare_kick` returns false, and **no interrupt is
-triggered**. This is exactly the failure mode that Bug 1 (lost IRQ for
-already-processed descriptors) and Bug 7 (irqfd workqueue race) produce —
-new used-ring entries already in guest memory, IRQ never delivered, guest
-parked on the old descriptors waiting for completion.
+triggered**. This is exactly the failure mode that Bug 7 (irqfd workqueue
+race) produces — new used-ring entries already in guest memory, IRQ never
+delivered, guest parked on the old descriptors waiting for completion.
 
 For vsock the equivalent failure is masked by the unconditional re-trigger.
 For block (which is the device the original PR #6 freeze test exercises)
-there is no such safety net, so even with Bugs 1, 2, 3 fixed via upstream
-backports, a separate Bug 7 occurrence at snapshot time can still freeze
-the guest. The robust answer would be for `VirtioBlock::kick` (and net's
-kick at [`net/device.rs:1062-1071`][net_kick]) to call `prepare_kick` on each
-queue and re-trigger the IRQ if there are unacked used-ring entries — i.e.
-mirror what vsock does. Filing as **C** because it's the residual hole that
-makes a coordinated Bug 1 / Bug 7 fix not fully sufficient on its own.
+there is no such safety net, so even with the ordering bugs fixed by
+`639196c95`, a Bug 7 occurrence at snapshot time can still freeze the guest.
+The robust answer would be for `VirtioBlock::kick` (and net's kick at
+[`net/device.rs:1042-1052`][net_kick]) to call `prepare_kick` on each queue
+and re-trigger the IRQ if there are unacked used-ring entries — i.e. mirror
+what vsock does. Filing as **C** because it's the residual hole that makes
+a Bug 7 occurrence not recoverable.
 
-[net_kick]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/net/device.rs#L1062-L1071
+[net_kick]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/net/device.rs#L1042-L1052
 
 ---
 
@@ -659,20 +550,19 @@ A single table of where IRQ retrigger does and doesn't happen on resume:
 
 | Device | `kick()` behavior | Recovers lost-IRQ class? |
 |---|---|---|
-| Block ([`device.rs:219-228`][block_kick]) | `process_virtio_queues()` — reads avail ring only | **No** — needs new descriptors to fire any IRQ |
-| Net ([`net/device.rs:1062-1071`][net_kick]) | `process_virtio_queues()` — reads RX+TX | **No** — same as block |
+| Block ([`device.rs:212-222`][block_kick]) | `process_virtio_queues()` — reads avail ring only | **No** — needs new descriptors to fire any IRQ |
+| Net ([`net/device.rs:1042-1052`][net_kick]) | `process_virtio_queues()` — reads RX+TX | **No** — same as block |
 | Vsock ([`vsock/device.rs:382-393`][vsock_kick]) | `signal_used_queue(EVQ)` — unconditional IRQ retrigger on EVQ | Yes (for EVQ only) |
 | Balloon ([`balloon/device.rs:1000-1008`][balloon_kick]) | replays queued FPH work via `process_virtio_queues` | **No** for IRQ; OK for FPH replay |
 | RNG/Entropy / PMem / virtio-mem | default `fn kick(&mut self) {}` (no-op) | **No** |
 
-[balloon_kick]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/balloon/device.rs#L1000-L1008
+[balloon_kick]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/balloon/device.rs#L1000-L1008
 
-This means the Bug 1 / Bug 7 class is **only** mitigated by:
-
-- (a) Correct ordering on the save side (upstream `67ba7a206` + `48a5ae3b2`),
-  and
-- (b) For irqfd's workqueue race (Bug 7), explicit kernel-state-drain logic
-  that doesn't exist anywhere in this tree.
+This means the Bug 7 lost-IRQ class is **only** mitigated by explicit
+kernel-state-drain logic at snapshot time, which doesn't exist anywhere in
+this tree. The (now-applied) save-side ordering fix `639196c95` closes the
+synchronous lost-IRQ window but does not handle the kernel-side asynchronous
+irqfd injection window.
 
 There is no resume-side safety net for block/net/RNG/PMem/virtio-mem.
 
@@ -729,8 +619,8 @@ To narrow the search space, the following were checked and are not bugs:
   → `restore_helper` calls `device.lock().activate(mem, interrupt)` when the
   saved `is_activated()` is true
   ([`device_manager/persist.rs:388-427`][restore_activate]) — so the IRQ /
-  used-ring state is re-armed, *provided* it was correctly snapshotted (the
-  precondition Bugs 1–3 violate).
+  used-ring state is re-armed, *provided* it was correctly snapshotted
+  (which the now-fixed ordering bugs used to violate).
 - **VMGenID interrupt on restore** is correctly handled by saving devices
   *after* KVM state on the restore side (see
   [`src/vmm/src/builder.rs:497-510`][restore_order] and the comment there);
@@ -742,19 +632,19 @@ To narrow the search space, the following were checked and are not bugs:
   resolves on the next RX frame after restore — not a freeze, just a
   one-event-delay for a single deferred frame.
 
-[nodrop]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/io_uring/mod.rs#L334-L346
-[throttle]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/device.rs#L520-L540
-[throttle_clear]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/device.rs#L674-L687
-[throttle_persist]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/persist.rs#L149
-[rl_persist]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/rate_limiter/persist.rs#L11-L50
-[rl_restore]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/rate_limiter/persist.rs#L73-L87
-[dirty]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs#L53-L67
-[dirty_pop]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs#L286-L299
-[queue_used]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/queue.rs#L557-L606
-[seccomp]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/resources/seccomp/x86_64-unknown-linux-musl.json
-[restore_activate]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/persist.rs#L388-L427
-[restore_order]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/builder.rs#L497-L510
-[net_prep]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/net/device.rs#L943-L960
+[nodrop]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/io_uring/mod.rs#L334-L346
+[throttle]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/virtio/device.rs#L520-L540
+[throttle_clear]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/virtio/device.rs#L674-L687
+[throttle_persist]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/virtio/persist.rs#L149
+[rl_persist]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/rate_limiter/persist.rs#L11-L50
+[rl_restore]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/rate_limiter/persist.rs#L73-L87
+[dirty]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs#L53-L67
+[dirty_pop]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs#L286-L299
+[queue_used]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/queue.rs#L557-L606
+[seccomp]: https://github.com/e2b-dev/firecracker/blob/639196c95/resources/seccomp/x86_64-unknown-linux-musl.json
+[restore_activate]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/device_manager/persist.rs#L388-L427
+[restore_order]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/builder.rs#L497-L510
+[net_prep]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/net/device.rs#L943-L960
 
 ## Implications for net-vs-block VMM contention
 
@@ -824,9 +714,9 @@ template → diff → diff workflows (which `pauseProcessRootfs` /
 `pauseProcessMemory` in the orchestrator support) it inflates the diff
 footprint and can mis-represent which pages actually changed.
 
-[create_snapshot]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/persist/mod.rs#L159-L181
-[snapshot_mem]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/vstate/vm.rs#L335-L395
-[reset_dirty]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/vstate/vm.rs#L385-L389
+[create_snapshot]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/persist/mod.rs#L159-L181
+[snapshot_mem]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/vstate/vm.rs#L335-L395
+[reset_dirty]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/vstate/vm.rs#L385-L389
 
 ---
 
@@ -867,7 +757,7 @@ is a contract bug, not an exploited one — but `/memory/mappings` is exactly
 the kind of API external tooling integrates against, and the missing gate
 makes it a footgun.
 
-[meminfo_rpc]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/rpc_interface.rs#L963-L1010
+[meminfo_rpc]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/rpc_interface.rs#L963-L1010
 
 ---
 
@@ -895,8 +785,8 @@ virtio-mem is not used by the orchestrator today, so this is latent. It
 becomes load-bearing the moment virtio-mem is turned on (which is on the
 roadmap, given that PR #13 already added virtio-block discard/write-zeroes).
 
-[guest_mappings]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/lib.rs#L701-L724
-[dump_memory]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/vstate/memory.rs#L689-L701
+[guest_mappings]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/lib.rs#L701-L724
+[dump_memory]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/vstate/memory.rs#L689-L701
 
 ---
 
@@ -936,8 +826,8 @@ operator believes they removed.
 
 [orch_setrl]: https://github.com/e2b-dev/infra/blob/main/packages/orchestrator/pkg/sandbox/fc/client.go
 [orch_rl_model]: https://github.com/e2b-dev/infra/blob/main/packages/shared/pkg/fc/models/rate_limiter.go
-[fc_patch]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/rpc_interface.rs#L914-L940
-[bucket_update]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/vmm_config/mod.rs#L96-L115
+[fc_patch]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/rpc_interface.rs#L914-L940
+[bucket_update]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/vmm_config/mod.rs#L96-L115
 
 ---
 
@@ -968,8 +858,8 @@ implementation; the spec-compliant behavior is to ignore stale hint state
 when the cmd_id resets, but it's a delta worth noting.
 
 [orch_drain]: https://github.com/e2b-dev/infra/blob/main/packages/orchestrator/pkg/sandbox/fc/process.go
-[balloon_save]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/balloon/persist.rs#L100-L135
-[balloon_restore]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/balloon/persist.rs#L180-L210
+[balloon_save]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/balloon/persist.rs#L100-L135
+[balloon_restore]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/balloon/persist.rs#L180-L210
 
 ---
 
@@ -995,7 +885,7 @@ No cross-sandbox leak (the previous MMDS body genuinely isn't there) —
 the issue is the "uninitialized for a few ms after resume" window for the
 new guest.
 
-[mmds_state]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/persist.rs#L119-L123
+[mmds_state]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/device_manager/persist.rs#L119-L123
 [infra-resume]: https://github.com/e2b-dev/infra/blob/main/packages/orchestrator/pkg/sandbox/fc/process.go
 
 ---
@@ -1014,8 +904,8 @@ rate-limiter persistence question doesn't apply here yet — but if it lands,
 it inherits the same "rate-limiter timerfd disarmed on restore" pattern
 discussed under Bug 5.
 
-[serial_save]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/persist.rs#L211-L226
-[serial_init]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/mod.rs#L495-L540
+[serial_save]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/device_manager/persist.rs#L211-L226
+[serial_init]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/device_manager/mod.rs#L495-L540
 [serial_rl]: https://github.com/firecracker-microvm/firecracker/commit/9a49dcb03
 
 ---
@@ -1038,7 +928,7 @@ restore (failure rather than silent corruption), but cleanup of the
 truncated file is the operator's problem.
 
 [orch_stop]: https://github.com/e2b-dev/infra/blob/main/packages/orchestrator/pkg/sandbox/fc/process.go
-[snapshot_state_write]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/persist/mod.rs#L184-L203
+[snapshot_state_write]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/persist/mod.rs#L184-L203
 
 ---
 
@@ -1091,14 +981,14 @@ unlikely to need attention; documenting them so they don't get rediscovered.
   main guest memory mapping is implemented behind a `shared_mem` flag on
   PR #8. The only `MAP_SHARED` path is the existing `memfd_backed` route.
 
-[flush_metrics]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/rpc_interface.rs#L851-L858
-[snap_version]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/persist/mod.rs#L460-L478
-[vmgenid_make]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/acpi/vmgenid.rs#L46-L62
-[builder_tsc]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/builder.rs#L462-L482
-[vm_clock]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/arch/x86_64/vm.rs#L128-L150
-[mark_dirty]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/device_manager/mod.rs#L303-L329
-[queue_init]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/devices/virtio/queue.rs#L335-L371
-[builder_restore]: https://github.com/e2b-dev/firecracker/blob/f0a35a156/src/vmm/src/builder.rs#L494-L517
+[flush_metrics]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/rpc_interface.rs#L851-L858
+[snap_version]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/persist/mod.rs#L460-L478
+[vmgenid_make]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/acpi/vmgenid.rs#L46-L62
+[builder_tsc]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/builder.rs#L462-L482
+[vm_clock]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/arch/x86_64/vm.rs#L128-L150
+[mark_dirty]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/device_manager/mod.rs#L303-L329
+[queue_init]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/queue.rs#L335-L371
+[builder_restore]: https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/builder.rs#L494-L517
 
 ---
 
@@ -1121,21 +1011,23 @@ flag here so we don't keep rediscovering them.
 
 ## References
 
-- Upstream fixes (both required to fully cover the bugs catalogued here):
+- Upstream fixes:
   - [`firecracker-microvm/firecracker@67ba7a206`][upstream-fix]
     ("fix: saving/restoring async IO engine transport state", 2025-12-15) —
-    addresses Bugs 1, 2, 3 by reordering `device_manager.save()` before KVM
-    state and `prepare_save()` before `transport_state.save()`.
+    addresses the lib.rs / device-manager / pci-manager ordering bugs by
+    reordering `device_manager.save()` before KVM state and `prepare_save()`
+    before `transport_state.save()`. **Cherry-picked onto PR #8 as
+    [`639196c95`][fix-639].**
   - [`firecracker-microvm/firecracker@48a5ae3b2`][upstream-vsock]
     ("refactor(vsock): Send reset event before saving transport state",
     2026-02-16) — addresses Bug 9 by moving vsock's reset event into
     `Vsock::prepare_save()` so it benefits from the new ordering. Depends
-    on the prior commit.
+    on the prior commit. **Not yet on PR #8.**
 - Freeze reproducer (closed):
   [`e2b-dev/firecracker#6`][pr6] (`test_snapshot_with_heavy_async_io`).
 - Current target branch:
   [`e2b-dev/firecracker#8`][pr8] — head
-  [`f0a35a156`][head].
+  [`639196c95`][head].
 - Sibling pause/snapshot-related fork patches that demonstrate signal delivery
   *can* occur during snapshot work:
   [`e2b-dev/firecracker#11`][pr11] (closed),
