@@ -94,4 +94,32 @@ mod tests {
 
         assert_eq!(cqe.user_data(), 11);
     }
+
+    // Reproducer for Bug 5 (docs/async-io-snapshot-analysis.md): `Cqe::result`
+    // forwards a *negative* kernel errno into `Error::from_raw_os_error`, which
+    // expects a positive value. The Error returned therefore loses its specific
+    // `ErrorKind` (it collapses to `Other`) and carries a negative `raw_os_error`.
+    // Today this is load-bearing for the discard / write-zeroes EOPNOTSUPP
+    // detection in `block/virtio/device.rs`, which compares against `-EOPNOTSUPP`.
+    #[test]
+    fn test_bug5_cqe_result_sign_flip() {
+        let buggy = Cqe::new(-libc::EOPNOTSUPP, ()).result().unwrap_err();
+        let correct = std::io::Error::from_raw_os_error(libc::EOPNOTSUPP);
+
+        // The bug: raw_os_error stays negative.
+        assert_eq!(buggy.raw_os_error(), Some(-libc::EOPNOTSUPP));
+        // The bug: kernel-specific ErrorKind is lost (negative codes are unrecognized).
+        assert_ne!(buggy.kind(), correct.kind());
+    }
+
+    // Post-fix counterpart of `test_bug5_cqe_result_sign_flip`. Fails today,
+    // passes once `Cqe::result` negates `self.res` before `from_raw_os_error`.
+    #[test]
+    #[ignore = "passes only with Bug 5 fix applied"]
+    fn test_bug5_fix_cqe_result_preserves_errno() {
+        let err = Cqe::new(-libc::EOPNOTSUPP, ()).result().unwrap_err();
+        let correct = std::io::Error::from_raw_os_error(libc::EOPNOTSUPP);
+        assert_eq!(err.raw_os_error(), Some(libc::EOPNOTSUPP));
+        assert_eq!(err.kind(), correct.kind());
+    }
 }

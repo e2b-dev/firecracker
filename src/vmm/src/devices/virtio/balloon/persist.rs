@@ -264,6 +264,93 @@ mod tests {
         assert_eq!(restored_balloon.latest_stats, balloon.latest_stats);
     }
 
+    // Reproducer for Finding P2-5 (docs/async-io-snapshot-analysis.md): the
+    // balloon persists `hinting_state` (which carries the mid-chain bookkeeping)
+    // but force-resets `config_space.free_page_hint_cmd_id` to
+    // `FREE_PAGE_HINT_DONE` on restore. If `DrainBalloon` times out mid-cycle,
+    // the restored device claims "done" via the config space while the hinting
+    // state still says "mid-chain", which a guest driver may or may not
+    // tolerate.
+    #[test]
+    fn test_p2_5_balloon_cmd_id_hinting_state_mismatch() {
+        let guest_mem = default_mem();
+        let mut mem = vec![0; 4096];
+
+        let mut balloon = Balloon::new(0, false, 0, true, false).unwrap();
+
+        // Simulate a mid-chain DrainBalloon snapshot: host has an in-flight
+        // FREE_PAGE_HINT command and the guest acked a chain id != DONE.
+        balloon.config_space.free_page_hint_cmd_id = 42;
+        balloon.hinting_state.host_cmd = 42;
+        balloon.hinting_state.last_cmd_id = 42;
+        balloon.hinting_state.guest_cmd = Some(42);
+        balloon.hinting_state.acknowledge_on_finish = true;
+
+        Snapshot::new(balloon.save())
+            .save(&mut mem.as_mut_slice())
+            .unwrap();
+
+        let restored = Balloon::restore(
+            BalloonConstructorArgs { mem: guest_mem },
+            &Snapshot::load_without_crc_check(mem.as_slice())
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+
+        // hinting_state survives intact across the snapshot...
+        assert_eq!(restored.hinting_state.host_cmd, 42);
+        assert_eq!(restored.hinting_state.guest_cmd, Some(42));
+        assert!(restored.hinting_state.acknowledge_on_finish);
+
+        // ...but the config space field is force-reset to DONE on restore,
+        // producing the mid-chain / "done" disagreement described in P2-5.
+        assert_eq!(
+            restored.config_space.free_page_hint_cmd_id,
+            FREE_PAGE_HINT_DONE
+        );
+        assert_ne!(
+            restored.config_space.free_page_hint_cmd_id,
+            restored.hinting_state.host_cmd
+        );
+    }
+
+    // Post-fix counterpart of `test_p2_5_balloon_cmd_id_hinting_state_mismatch`
+    // (option 1 — honor persisted cmd_id). Fails today, passes once
+    // `BalloonConfigSpaceState` carries `free_page_hint_cmd_id` and restore
+    // uses it instead of the hard-coded `FREE_PAGE_HINT_DONE`.
+    #[test]
+    #[ignore = "passes only with P2-5 fix (option 1) applied"]
+    fn test_p2_5_fix_balloon_cmd_id_honors_persisted_value() {
+        let guest_mem = default_mem();
+        let mut mem = vec![0; 4096];
+
+        let mut balloon = Balloon::new(0, false, 0, true, false).unwrap();
+        balloon.config_space.free_page_hint_cmd_id = 42;
+        balloon.hinting_state.host_cmd = 42;
+        balloon.hinting_state.last_cmd_id = 42;
+        balloon.hinting_state.guest_cmd = Some(42);
+        balloon.hinting_state.acknowledge_on_finish = true;
+
+        Snapshot::new(balloon.save())
+            .save(&mut mem.as_mut_slice())
+            .unwrap();
+
+        let restored = Balloon::restore(
+            BalloonConstructorArgs { mem: guest_mem },
+            &Snapshot::load_without_crc_check(mem.as_slice())
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+
+        assert_eq!(restored.config_space.free_page_hint_cmd_id, 42);
+        assert_eq!(
+            restored.config_space.free_page_hint_cmd_id,
+            restored.hinting_state.host_cmd
+        );
+    }
+
     #[test]
     fn test_wait_on_ack_round_trips_snapshot() {
         let guest_mem = default_mem();

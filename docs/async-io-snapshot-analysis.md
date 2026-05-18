@@ -4,6 +4,8 @@ Baseline [`639196c95`][head] on PR #8 (Bugs 1–3 closed by that cherry-pick of 
 
 Severity: **C** can freeze guest after resume · **M** can corrupt / hang under stress · **L** scenario-bound.
 
+Minimal reproducers for Bugs 5, 9, 10, P2-5 live in [`snapshot-bug-repros.md`](snapshot-bug-repros.md).
+
 [head]: https://github.com/e2b-dev/firecracker/tree/639196c95
 [upstream-fix]: https://github.com/firecracker-microvm/firecracker/commit/67ba7a206
 [upstream-vsock]: https://github.com/firecracker-microvm/firecracker/commit/48a5ae3b2

@@ -206,6 +206,99 @@ mod tests {
         assert_eq!(FileEngineTypeState::default(), FileEngineTypeState::Sync);
     }
 
+    // Reproducer for Bug 8 (docs/async-io-snapshot-analysis.md): block save state
+    // does not persist the `queue_evt` EventFd counter. Any pending `QueueNotify`
+    // count the host hadn't drained before pause is silently lost; the restored
+    // device's `queue_evt` is a fresh EventFd in `EFD_NONBLOCK` mode with count=0.
+    // Mitigated by `Vmm::resume_vm → kick_virtio_devices` (block's `kick` re-reads
+    // the avail ring), so this only bites when `resume_vm` is bypassed.
+    #[test]
+    fn test_bug8_block_queue_evt_count_not_persisted() {
+        let f = TempFile::new().unwrap();
+        f.as_file().set_len(0x1000).unwrap();
+        let config = VirtioBlockConfig {
+            drive_id: "test".to_string(),
+            path_on_host: f.as_path().to_str().unwrap().to_string(),
+            is_root_device: false,
+            partuuid: None,
+            is_read_only: false,
+            cache_type: CacheType::Unsafe,
+            rate_limiter: None,
+            file_engine_type: FileEngineType::default(),
+        };
+        let block = VirtioBlock::new(config).unwrap();
+
+        // Simulate 3 undrained QueueNotify events sitting on queue_evts[0].
+        block.queue_events()[0].write(3).unwrap();
+
+        let mut mem = vec![0; 4096];
+        Snapshot::new(block.save())
+            .save(&mut mem.as_mut_slice())
+            .unwrap();
+
+        let restored = VirtioBlock::restore(
+            BlockConstructorArgs {
+                mem: default_mem(),
+            },
+            &Snapshot::load_without_crc_check(mem.as_slice())
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+
+        // Bug: restored queue_evt is a fresh EventFd, count starts at 0.
+        let read_result = restored.queue_events()[0].read();
+        assert!(
+            read_result.is_err(),
+            "expected EAGAIN on restored queue_evt, but read returned {:?}",
+            read_result
+        );
+        assert_eq!(
+            read_result.unwrap_err().raw_os_error(),
+            Some(libc::EAGAIN),
+            "Bug 8: restored queue_evt should be empty"
+        );
+    }
+
+    // Post-fix counterpart of `test_bug8_block_queue_evt_count_not_persisted`.
+    // Fails today, passes once `BlockState` carries `queue_evt_counts` and
+    // `restore` seeds the new EventFds with the saved counts.
+    #[test]
+    #[ignore = "passes only with Bug 8 fix applied"]
+    fn test_bug8_fix_block_queue_evt_count_round_trips() {
+        let f = TempFile::new().unwrap();
+        f.as_file().set_len(0x1000).unwrap();
+        let config = VirtioBlockConfig {
+            drive_id: "test".to_string(),
+            path_on_host: f.as_path().to_str().unwrap().to_string(),
+            is_root_device: false,
+            partuuid: None,
+            is_read_only: false,
+            cache_type: CacheType::Unsafe,
+            rate_limiter: None,
+            file_engine_type: FileEngineType::default(),
+        };
+        let block = VirtioBlock::new(config).unwrap();
+        block.queue_events()[0].write(3).unwrap();
+
+        let mut mem = vec![0; 4096];
+        Snapshot::new(block.save())
+            .save(&mut mem.as_mut_slice())
+            .unwrap();
+
+        let restored = VirtioBlock::restore(
+            BlockConstructorArgs {
+                mem: default_mem(),
+            },
+            &Snapshot::load_without_crc_check(mem.as_slice())
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+
+        assert_eq!(restored.queue_events()[0].read().unwrap(), 3);
+    }
+
     #[test]
     fn test_persistence() {
         // We create the backing file here so that it exists for the whole lifetime of the test.

@@ -1713,6 +1713,74 @@ mod tests {
         }
     }
 
+    // Reproducer for Bug 10 (docs/async-io-snapshot-analysis.md): on resume,
+    // `Block::kick` calls `process_virtio_queues` which only walks the *avail*
+    // ring. If the guest hasn't queued anything new, `used_any` stays false and
+    // no IRQ is triggered — even when there are completed used-ring entries from
+    // before the snapshot still waiting for a notification. Contrast with vsock,
+    // whose `kick` calls `signal_used_queue(EVQ_INDEX)` unconditionally.
+    #[test]
+    fn test_bug10_block_kick_misses_pre_snapshot_used_entries() {
+        let mut block = default_block(FileEngineType::Sync);
+        let mem = default_mem();
+        let interrupt = default_interrupt();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        block.activate(mem.clone(), interrupt).unwrap();
+
+        // Simulate the pre-snapshot state: a request was processed and its used
+        // entry was placed in guest memory, but the IRQ for it was lost (e.g.
+        // Bug 7). On resume, no new avail descriptors are queued by the guest.
+        block.queues[0].add_used(0, 0).unwrap();
+        block.queues[0].advance_used_ring_idx();
+        assert!(
+            !block
+                .interrupt_trigger()
+                .has_pending_interrupt(VirtioInterruptType::Queue(0))
+        );
+
+        // `Block::kick` ends up calling `VirtioBlock::process_virtio_queues`.
+        block.process_virtio_queues().unwrap();
+
+        // Bug: the resume-side kick did not re-fire the IRQ for the pre-existing
+        // used entry, because the avail ring is empty. A correct kick would call
+        // `signal_used_queue` unconditionally (as vsock's `kick` does).
+        assert!(
+            !block
+                .interrupt_trigger()
+                .has_pending_interrupt(VirtioInterruptType::Queue(0)),
+            "block kick unexpectedly fired IRQ; Bug 10 may be fixed"
+        );
+    }
+
+    // Post-fix counterpart of `test_bug10_block_kick_misses_pre_snapshot_used_entries`.
+    // Fails today, passes once `Block::kick` triggers `VirtioInterruptType::Queue(0)`
+    // unconditionally after `process_virtio_queues`.
+    #[test]
+    #[ignore = "passes only with Bug 10 fix applied"]
+    fn test_bug10_fix_block_kick_fires_irq_for_pre_snapshot_used_entries() {
+        use crate::devices::virtio::block::device::Block;
+
+        let mut virtio = default_block(FileEngineType::Sync);
+        let mem = default_mem();
+        let interrupt = default_interrupt();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut virtio, 0, vq.create_queue());
+        virtio.activate(mem.clone(), interrupt).unwrap();
+
+        virtio.queues[0].add_used(0, 0).unwrap();
+        virtio.queues[0].advance_used_ring_idx();
+
+        let mut block = Block::Virtio(virtio);
+        block.kick();
+
+        assert!(
+            block
+                .interrupt_trigger()
+                .has_pending_interrupt(VirtioInterruptType::Queue(0))
+        );
+    }
+
     fn add_flush_requests_batch(block: &mut VirtioBlock, vq: &VirtQueue, count: u16) {
         let mem = vq.memory();
         vq.avail.idx.set(0);

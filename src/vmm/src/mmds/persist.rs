@@ -50,8 +50,43 @@ impl Persist<'_> for MmdsNetworkStack {
 #[cfg(test)]
 mod tests {
 
+    use serde_json::json;
+
     use super::*;
+    use crate::device_manager::persist::MmdsState;
     use crate::snapshot::Snapshot;
+
+    // Reproducer for Finding P2-6 (docs/async-io-snapshot-analysis.md): the
+    // device_manager only persists `{version, imds_compat}` into `MmdsState`;
+    // the IMDS JSON datastore itself is dropped. On restore, the orchestrator
+    // calls `setMmds` *after* `resumeVM`, so guests that read MMDS during the
+    // first ticks of the resumed kernel observe `NotInitialized`.
+    #[test]
+    fn test_p2_6_mmds_data_store_not_persisted() {
+        let mut mmds = Mmds::default();
+        mmds.put_data(json!({ "instance-id": "i-test", "secret": "abc" }))
+            .unwrap();
+        assert_eq!(mmds.data_store_value()["instance-id"], json!("i-test"));
+
+        // Verbatim of what device_manager::persist::save writes into the
+        // snapshot for MMDS (src/vmm/src/device_manager/persist.rs:271-275).
+        let saved = MmdsState {
+            version: mmds.version(),
+            imds_compat: mmds.imds_compat(),
+        };
+
+        // Restore the way builder.rs / NetPersist::restore do it: fresh
+        // `Mmds::default()` then apply whatever the saved state carries.
+        let mut restored = Mmds::default();
+        restored.set_version(saved.version);
+        restored.set_imds_compat(saved.imds_compat);
+
+        // Bug: the data store is gone after restore.
+        assert!(
+            restored.data_store_value().is_null(),
+            "P2-6: expected empty data store on restore"
+        );
+    }
 
     #[test]
     fn test_persistence() {

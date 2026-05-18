@@ -198,6 +198,26 @@ mod tests {
         assert_eq!(rl.ops().unwrap().refill_time_ms(), REFILL_TIME * 2);
     }
 
+    // Reproducer for Finding P2-4 (docs/async-io-snapshot-analysis.md): the
+    // orchestrator sends an empty `{}` PATCH "to reset any limit persisted in a
+    // snapshot". But empty JSON deserializes into a RateLimiterConfig with both
+    // `bandwidth` and `ops` set to `None`, which `get_bucket_update` collapses
+    // into `BucketUpdate::None` ("no change"). Result: the snapshot-persisted
+    // limits stay in place even though the orchestrator wanted them gone.
+    #[test]
+    fn test_p2_4_empty_rate_limiter_patch_is_noop() {
+        let empty_patch: RateLimiterConfig = serde_json::from_str("{}").unwrap();
+        assert!(empty_patch.bandwidth.is_none());
+        assert!(empty_patch.ops.is_none());
+
+        let update: RateLimiterUpdate = Some(empty_patch).into();
+
+        // Bug: both fields are `BucketUpdate::None` (i.e. "no change"); the
+        // restored device keeps whatever rate limit was persisted.
+        assert!(matches!(update.bandwidth, BucketUpdate::None));
+        assert!(matches!(update.ops, BucketUpdate::None));
+    }
+
     #[test]
     fn test_generate_configs() {
         let bw_tb_cfg = TokenBucketConfig {

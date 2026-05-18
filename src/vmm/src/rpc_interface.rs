@@ -1458,4 +1458,27 @@ mod tests {
             MemoryHotplugConfig::default(),
         )));
     }
+
+    // Reproducer for Finding P2-2 (docs/async-io-snapshot-analysis.md):
+    // `GetMemoryMappings` doesn't check `vmm.instance_info.state == Paused` the
+    // way `GetMemory` (L981) and `GetMemoryDirty` (L1000) do. Default state is
+    // `NotStarted`; the handler still returns `Ok`.
+    #[test]
+    fn test_p2_2_get_memory_mappings_not_gated_on_paused() {
+        let result = runtime_request(VmmAction::GetMemoryMappings);
+        assert!(matches!(result, Ok(VmmData::MemoryMappings(_))));
+    }
+
+    // Post-fix counterpart of `test_p2_2_get_memory_mappings_not_gated_on_paused`.
+    // Fails today, passes once `get_guest_memory_mappings` rejects non-paused
+    // states with `VmmActionError::OperationNotSupportedWhileRunning`.
+    #[test]
+    #[ignore = "passes only with P2-2 fix applied"]
+    fn test_p2_2_fix_get_memory_mappings_requires_paused() {
+        let result = runtime_request(VmmAction::GetMemoryMappings);
+        assert!(matches!(
+            result,
+            Err(VmmActionError::OperationNotSupportedWhileRunning)
+        ));
+    }
 }

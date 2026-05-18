@@ -470,4 +470,50 @@ mod tests {
             .activate(ctx.mem.clone(), ctx.interrupt.clone())
             .unwrap();
     }
+
+    // Reproducer for Bug 9 (docs/async-io-snapshot-analysis.md): `Vsock` does not
+    // implement `prepare_save`, so `device_manager::persist::save` runs the
+    // sequence (1) capture transport state, (2) call `send_transport_reset_event`
+    // — and step 2 mutates the same `interrupt_status` step 1 just snapshotted.
+    // The resulting `MmioTransportState.interrupt_status` is stale relative to
+    // the device's actual state at the end of `save`. Same shape as the
+    // (now-fixed) block Bugs 2/3; the companion upstream commit `48a5ae3b2`
+    // adds `Vsock::prepare_save` and removes the manual post-save call.
+    #[test]
+    fn test_bug9_vsock_post_snapshot_irq_mutation() {
+        use std::sync::atomic::Ordering;
+
+        use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
+        use crate::devices::virtio::transport::mmio::VIRTIO_MMIO_INT_VRING;
+
+        let ctx = TestContext::new();
+        let mut ehc = ctx.create_event_handler_context();
+        ehc.mock_activate(ctx.mem.clone(), ctx.interrupt.clone());
+
+        // EVQ needs one writable descriptor for the reset event to land in.
+        ehc.guest_evvq.dtable[0].set(0x0050_0000, 4, VIRTQ_DESC_F_WRITE, 0);
+        ehc.guest_evvq.avail.ring[0].set(0);
+        ehc.guest_evvq.avail.idx.set(1);
+
+        // (1) Verbatim of what `MmioTransport::save()` captures into
+        //     `MmioTransportState.interrupt_status`:
+        //     `self.interrupt.irq_status.load(Ordering::SeqCst)`.
+        let irq_status = ehc.device.interrupt_trigger().status();
+        let captured_interrupt_status = irq_status.load(Ordering::SeqCst);
+        assert_eq!(captured_interrupt_status, 0);
+
+        // (2) Verbatim of what `device_manager::persist::save` runs *after* the
+        //     transport state was captured:
+        //     `vsock.send_transport_reset_event().unwrap_or_else(...)`.
+        ehc.device.send_transport_reset_event().unwrap();
+
+        // Bug 9 witness: the snapshot file's `interrupt_status` is now stale
+        // relative to the device's live interrupt_status.
+        let live_interrupt_status = irq_status.load(Ordering::SeqCst);
+        assert_ne!(captured_interrupt_status, live_interrupt_status);
+        assert_eq!(
+            live_interrupt_status & VIRTIO_MMIO_INT_VRING,
+            VIRTIO_MMIO_INT_VRING
+        );
+    }
 }
