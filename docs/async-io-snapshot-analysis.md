@@ -124,6 +124,10 @@ AFAICT, this is a valid one. Fix similar to how we fixed the async IO engine.
 
 Block / Net `kick` only call `process_virtio_queues()`, which reads the *avail* ring. If the avail ring is empty on resume — i.e. the guest hasn't submitted anything new — `prepare_kick` returns false and no IRQ is triggered, *even if* used-ring entries from before the snapshot are sitting in guest memory waiting for an IRQ that Bug 7 caused to be lost. Vsock's `kick` retriggers `signal_used_queue` unconditionally, which is exactly the recovery shape needed. This is the residual hole that makes Bug 7 unrecoverable on the resume side for block / net.
 
+#### Analysis
+
+Before taking a snapshot we make sure any pending work (descriptor removed from available ring) is delivered properly to the guest (added to used ring). Once this is done, we inject an interrupt to the guest (if it needs it). I don't see how this can be a problem. (Maybe only in the unlikely case #bug 7 is a real thing).
+
 ---
 
 ### Finding P2-1 — `mem_file_path = None` skips KVM dirty-log reset [M, diff snapshots]
