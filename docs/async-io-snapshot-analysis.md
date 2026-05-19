@@ -82,6 +82,10 @@ Re `kick_submission_queue` calls `squeue::submit()` with `min_complete == 0` (it
 
 `prepare_save → trigger` writes to an irqfd, but KVM injects the IRQ into the IRQ chip / LAPIC *asynchronously* (kernel workqueue for legacy / level IRQs; faster but still async for MSI-X). There is no explicit "drain irqfd workqueue" before `save_vcpu_states` / `kvm.save_state`. Under heavy I/O + snapshot stress (the PR [#6][pr6] workload) the IRQ can land *after* KVM state was captured, producing the same lost-IRQ symptom as the now-fixed ordering bugs via a different mechanism. Bug 10 below explains why the resume-side `kick` can't recover this for block / net.
 
+#### Analysis
+
+Not sure yet, need to dive deeper into the kernel code paths. Not sure what happens when we save the LAPIC state (if it waits somehow with the WQ handling writes to it).
+
 ---
 
 ### Bug 8 — Pending `queue_evt` count is lost across snapshot [L, mitigated]
@@ -92,6 +96,10 @@ Re `kick_submission_queue` calls `squeue::submit()` with `min_complete == 0` (it
 
 The block device's `queue_evts` is rebuilt fresh on restore; any pending QueueNotify count the host hadn't drained before pause is lost. The host's `next_avail` then lags the guest's `avail_ring->idx` on the restored device. **Mitigated** by `Vmm::resume_vm() → device_manager.kick_virtio_devices()`: block's `kick` ([`block/device.rs:212-222`](https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/device.rs#L212-L222)) reads the avail ring, so the orchestrator's `resumeVM` call recovers it. Latent if `resume_vm` is ever bypassed (e.g. autoresume during load).
 
+#### Analysis
+
+This can never happen. `resume_vm()` is always called. Either by explicit resuming the VM, or when passing `resume: true` on `/snapshot/load`. So the `kick()` method is always called.
+
 ---
 
 ### Bug 9 — Vsock has the same ordering bug; companion upstream commit missing [C]
@@ -101,6 +109,10 @@ The block device's `queue_evts` is rebuilt fresh on restore; any pending QueueNo
 [`vsock/device.rs:259-281`](https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/vsock/device.rs#L259-L281)
 
 `Vsock::send_transport_reset_event` is still called from `device_manager` *after* `transport_state.save()` was captured. It writes to the event virtqueue and calls `signal_used_queue → trigger_irq(Vring) → irq_status.fetch_or(...)`, mutating exactly the `interrupt_status` (MMIO) / `msix_state` PBA (PCI) that the snapshot just froze. Same shape as the closed Bug 2 / Bug 3 for block. The `639196c95` cherry-pick doesn't fix vsock because `Vsock` doesn't implement `prepare_save` (verify: `grep "fn prepare_save" src/vmm/src/devices/virtio/vsock/device.rs` → empty). Fix: cherry-pick [`48a5ae3b2`][upstream-vsock] which adds `Vsock::prepare_save` and removes the manual call. *Partial mitigation today*: `Vsock::kick` ([`vsock/device.rs:382-393`](https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/vsock/device.rs#L382-L393)) unconditionally re-fires `signal_used_queue(EVQ)` on resume, so the guest usually gets `TRANSPORT_RESET` anyway — fragile, relies on `resumeVM` + correct notification-suppression behavior.
+
+#### Analysis
+
+AFAICT, this is a valid one. Fix similar to how we fixed the async IO engine.
 
 ---
 
