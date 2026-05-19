@@ -21,6 +21,31 @@ Minimal reproducers for Bugs 5, 9, 10, P2-5 live in [`snapshot-bug-repros.md`](s
 
 `drain_and_flush` calls `submit_and_wait_all` (one `io_uring_enter` with no `EINTR` retry) + `file.sync_all`. Errors are logged and dropped, then `process_async_completion_queue` runs anyway. If the drain didn't actually finish, in-flight ops have no CQEs → `PendingRequest` stays in the slab → `desc_idx` was already advanced past in the avail ring → no used-ring entry produced. Snapshot is written claiming `next_avail = N`; on restore that descriptor is permanently lost → guest blk_mq tag never returned → in-kernel hang. Same external symptom as the (now-fixed) ordering bugs, different cause. Also missing: invariant check that `engine.num_ops() == 0` after a successful drain (PR [#6][pr6] added `pending_ops()` for exactly this).
 
+#### Analysis
+
+This seems correct, regarding the effect: Firecracker handles EINTR as any other error. in the `io_uring_enter()` syscall. The handling Firecracker does in this case
+is that it logs the error and continues, instead of crashing. We can try to make the handling a bit more robust for the case of EINTR. Changing the way errors are handled
+in general here would be a much bigger change.
+
+One thing to note here, is that EINTR is only possible if we're passing the `IORING_ENTER_GETEVENTS` flag, which we only do if there are actual pending events in the queue.
+This is of course possible but maybe not as common during snapshot time.
+
+Another thing that worries me is the `vmm::io_uring::submission::SubmissionQueue::submit` implementation of the `io_uring_enter()` system call. This one
+seems to use `into_result()` for translating the return value of the system call in a `Result` type. `into_result()` translates a -1 into an `Err` (using `errno`) otherwise `Ok`.
+
+The `man io_uring_enter(2)` says:
+
+```
+RETURN VALUE
+     io_uring_enter(2) returns the number of I/Os successfully consumed.  This can be zero if to_submit was zero or if the submission queue was empty. Note that if the ring was created with IORING_SETUP_SQPOLL specified, then the return value will generally be the same as to_submit as submission happens outside the context of the system call.
+
+     The errors related to a submission queue entry will be returned through a completion queue entry (see section CQE ERRORS), rather than through the system call itself.
+
+     Errors that occur not on behalf of a submission queue entry are returned via the system call directly. On such an error, a negative error code is returned. The caller should not rely on errno variable.
+```
+
+So, `io_uring_enter()` doesn't return -1 on error; it returns an actual (negative) error number. Which means that the error handling here is wrong.
+
 ---
 
 ### Bug 5 — `Cqe::result` passes negative kernel errno to `from_raw_os_error` [M]
