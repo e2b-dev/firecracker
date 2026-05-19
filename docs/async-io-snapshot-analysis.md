@@ -54,6 +54,10 @@ So, `io_uring_enter()` doesn't return -1 on error; it returns an actual (negativ
 
 io_uring puts a *negative* errno into `cqe.res`; `from_raw_os_error` expects positive. With negative, `ErrorKind` collapses to `Other` regardless of the real errno. Load-bearing on PR #8: the discard / write-zeroes "host doesn't support this" detection at [`block/virtio/device.rs:590-668`](https://github.com/e2b-dev/firecracker/blob/639196c95/src/vmm/src/devices/virtio/block/virtio/device.rs#L590-L668) compares against `Some(-libc::EOPNOTSUPP)` and only works because `Cqe::result` is broken. Any sign-flip fix must also flip that comparison to positive `EOPNOTSUPP`, or discard / write_zeroes will start returning `VIRTIO_BLK_S_IOERR` to the guest on every unsupported-fs request.
 
+#### Analysis
+
+AFAICT, `Error::from_os_error` [expects a `RawOsError`](https://doc.rust-lang.org/std/io/struct.Error.html#method.from_raw_os_error). `RawOsError` [is an `i32`](https://doc.rust-lang.org/std/io/type.RawOsError.html) on all currently supported platforms.
+
 ---
 
 ### Bug 6 — `process_queue` early-`?` leaves pushed SQEs un-kicked [L]
