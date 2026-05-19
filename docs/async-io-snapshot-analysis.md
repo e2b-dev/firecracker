@@ -67,6 +67,12 @@ AFAICT, `Error::from_os_error` [expects a `RawOsError`](https://doc.rust-lang.or
 
 If `pop_or_enable_notification` returns `Err(InvalidAvailIdx)`, the function exits via `?` *before* `kick_submission_queue` is called; any SQEs already pushed in this call sit in the SQ until the next `process_queue` invocation. Separately, `kick_submission_queue` itself issues `io_uring_enter` with no `EINTR` retry — same flavor as Bug 4 but in the steady-state path. Low severity because `InvalidAvailIdx` shouldn't happen with a non-malicious guest; defense-in-depth only.
 
+#### Analysis
+
+Re `pop_or_enable_notification`: `InvalidAvailIdx` is a hard error for Firecracker. If `InvalidAvailIdx` ever returns `pop_or_enable_notification` Firecracker will crash. This is expected as this error signifies a malicious/buggy guest.
+
+Re `kick_submission_queue` calls `squeue::submit()` with `min_complete == 0` (it doesn't block at all). According to the man page this shouldn't enable `IORING_ENTER_GETEVENTS` so this should never return an `EINTR`  
+
 ---
 
 ### Bug 7 — irqfd injection race with KVM state save [C/M]
