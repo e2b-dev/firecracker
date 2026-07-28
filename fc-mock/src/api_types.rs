@@ -270,6 +270,10 @@ pub struct GuestRegionUffdMapping {
     pub base_host_virt_addr: u64,
     pub size: usize,
     pub offset: u64,
+    // Firecracker still names this field `page_size_kib` even though it carries
+    // bytes; e2b's UFFD handler reads that name, and gets 0 (rejected as an
+    // unsupported page size) if the handshake sends `page_size`.
+    #[serde(rename = "page_size_kib", alias = "page_size")]
     pub page_size: usize,
 }
 
