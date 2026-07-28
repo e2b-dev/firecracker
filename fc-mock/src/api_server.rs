@@ -236,6 +236,20 @@ pub async fn handle(method: Method, path: &str, body: &[u8], state: Shared) -> R
                     warn!("Failed to allocate guest memory: {e}");
                 }
             }
+            // A restored VM carries its devices from the snapshot, so callers
+            // PATCH eth0's rate limiter without ever having PUT it. We don't
+            // model snapshot contents, so synthesize the interface here rather
+            // than 400 on the PATCH.
+            s.network_interfaces
+                .entry("eth0".to_string())
+                .or_insert_with(|| NetworkInterfaceConfig {
+                    iface_id: "eth0".to_string(),
+                    host_dev_name: "tap0".to_string(),
+                    guest_mac: None,
+                    rx_rate_limiter: None,
+                    tx_rate_limiter: None,
+                });
+
             s.lifecycle = if params.resume_vm { Lifecycle::Running } else { Lifecycle::Paused };
             s.started_at = Some(Instant::now());
 
