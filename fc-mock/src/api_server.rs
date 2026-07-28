@@ -237,9 +237,9 @@ pub async fn handle(method: Method, path: &str, body: &[u8], state: Shared) -> R
                 }
             }
             // A restored VM carries its devices from the snapshot, so callers
-            // PATCH eth0's rate limiter without ever having PUT it. We don't
-            // model snapshot contents, so synthesize the interface here rather
-            // than 400 on the PATCH.
+            // PATCH them (rate limiters, drive paths) without ever having PUT
+            // them. We don't model snapshot contents, so synthesize the devices
+            // a e2b snapshot always has rather than 400 on the PATCH.
             s.network_interfaces
                 .entry("eth0".to_string())
                 .or_insert_with(|| NetworkInterfaceConfig {
@@ -248,6 +248,19 @@ pub async fn handle(method: Method, path: &str, body: &[u8], state: Shared) -> R
                     guest_mac: None,
                     rx_rate_limiter: None,
                     tx_rate_limiter: None,
+                });
+            s.drives
+                .entry("rootfs".to_string())
+                .or_insert_with(|| BlockDeviceConfig {
+                    drive_id: "rootfs".to_string(),
+                    partuuid: None,
+                    is_root_device: true,
+                    cache_type: None,
+                    is_read_only: Some(false),
+                    path_on_host: None,
+                    rate_limiter: None,
+                    file_engine_type: None,
+                    socket: None,
                 });
 
             s.lifecycle = if params.resume_vm { Lifecycle::Running } else { Lifecycle::Paused };
