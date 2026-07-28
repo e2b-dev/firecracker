@@ -14,6 +14,31 @@ use serde::Serialize;
 
 const PAGE_SIZE: usize = 4096;
 
+/// How much of a guest starts out resident, in bytes. Enough that the
+/// orchestrator's memory export and dirty-tracking paths run against real data,
+/// small enough that many concurrent sandboxes fit in the test VM's budget.
+/// Override with FC_MOCK_WARM_MIB.
+const DEFAULT_WARM_MIB: usize = 8;
+
+fn warm_pages(total_pages: usize) -> usize {
+    let mib = std::env::var("FC_MOCK_WARM_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_WARM_MIB);
+
+    (mib * 1024 * 1024 / PAGE_SIZE).min(total_pages)
+}
+
+/// Bitmap with the first `set_pages` bits set.
+fn prefix_bitmap(words: usize, set_pages: usize) -> Vec<u64> {
+    let mut bits = vec![0u64; words];
+    for page in 0..set_pages {
+        bits[page / 64] |= 1u64 << (page % 64);
+    }
+
+    bits
+}
+
 pub struct GuestMemory {
     ptr: *mut u8,
     size: usize,
@@ -48,17 +73,22 @@ impl GuestMemory {
 
         let total_pages = size / PAGE_SIZE;
         let bitmap_words = (total_pages + 63) / 64;
-        let all_set = vec![u64::MAX; bitmap_words];
-        let all_clear = vec![0u64; bitmap_words];
+
+        // Only a prefix starts resident and dirty. Claiming the whole guest is
+        // resident makes the orchestrator read and export every page, which
+        // faults in the entire allocation — the mapping itself is lazy, so it is
+        // the claim, not the mmap, that costs memory. A real freshly-booted
+        // guest has touched a small fraction of its RAM anyway.
+        let warm = warm_pages(total_pages);
 
         Ok(Self {
             ptr: ptr as *mut u8,
             size,
             total_pages,
             bitmap_words,
-            dirty: all_set.clone(),
-            resident: all_set,
-            empty: all_clear,
+            dirty: prefix_bitmap(bitmap_words, warm),
+            resident: prefix_bitmap(bitmap_words, warm),
+            empty: vec![0u64; bitmap_words],
         })
     }
 
@@ -67,13 +97,14 @@ impl GuestMemory {
     pub fn from_existing(ptr: *mut u8, size: usize) -> Self {
         let total_pages = size / PAGE_SIZE;
         let bitmap_words = (total_pages + 63) / 64;
+        let warm = warm_pages(total_pages);
         Self {
             ptr,
             size,
             total_pages,
             bitmap_words,
             dirty: vec![0u64; bitmap_words],
-            resident: vec![u64::MAX; bitmap_words],
+            resident: prefix_bitmap(bitmap_words, warm),
             empty: vec![0u64; bitmap_words],
         }
     }
