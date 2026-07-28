@@ -262,6 +262,40 @@ pub struct Error {
 }
 
 // ---------------------------------------------------------------------------
+// vmm_config::balloon
+// ---------------------------------------------------------------------------
+
+/// `PUT /balloon`. The orchestrator installs a zero-MiB balloon purely to turn
+/// on free-page reporting/hinting, which it only does from FC 1.14 up.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BalloonConfig {
+    pub amount_mib: i64,
+    pub deflate_on_oom: bool,
+    #[serde(default)]
+    pub free_page_reporting: bool,
+    #[serde(default)]
+    pub free_page_hinting: bool,
+    #[serde(default, rename = "stats_polling_interval_s")]
+    pub stats_polling_interval_s: i64,
+}
+
+/// `PATCH /balloon/hinting/start`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BalloonStartCmd {
+    #[serde(default)]
+    pub acknowledge_on_stop: bool,
+}
+
+/// `GET /balloon/hinting/status`. `host_cmd` is the counter the orchestrator
+/// polls to see its hinting command acknowledged.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BalloonHintingStatus {
+    pub host_cmd: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guest_cmd: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
 // UFFD handshake (matches src/vmm/src/persist.rs GuestRegionUffdMapping)
 // ---------------------------------------------------------------------------
 

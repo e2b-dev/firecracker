@@ -7,10 +7,33 @@
 
 use std::time::Duration;
 
+use antithesis_sdk::random::get_random;
 use tracing::{info, warn};
 
 use crate::api_types::{FailureMode, WorkloadConfig};
 use crate::vm_state::{Lifecycle, Shared};
+
+/// Set to enable VM-level faults with no explicit `failure_mode` configured.
+/// Off by default so a plain run exercises the happy path.
+const FAULT_ENV: &str = "FC_MOCK_FAULT_INJECTION";
+
+/// Pick a failure mode using Antithesis' randomness, so the platform controls
+/// (and can replay) which VM failure a sandbox hits. Every decision is a fresh
+/// call — the values are deliberately not stored or used to seed a PRNG.
+fn choose_failure_mode() -> Option<FailureMode> {
+    if std::env::var(FAULT_ENV).map(|v| v == "0").unwrap_or(true) {
+        return None;
+    }
+
+    // Weighted so most sandboxes still complete: 5 in 8 draws inject nothing.
+    let after_ms = 1_000 + get_random() % 30_000;
+    match get_random() % 8 {
+        0 => Some(FailureMode::Crash { after_ms }),
+        1 => Some(FailureMode::Hang { after_ms }),
+        2 => Some(FailureMode::Oom { after_ms }),
+        _ => None,
+    }
+}
 
 pub fn start(state: Shared, config: WorkloadConfig) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -21,9 +44,8 @@ pub fn start(state: Shared, config: WorkloadConfig) -> tokio::task::JoinHandle<(
             "Workload simulation started"
         );
 
-        if let Some(ref fm) = config.failure_mode {
+        if let Some(fm) = config.failure_mode.clone().or_else(choose_failure_mode) {
             let s = state.clone();
-            let fm = fm.clone();
             tokio::spawn(async move { run_failure(s, fm).await });
         }
 
@@ -74,7 +96,7 @@ async fn burn_cpu(percent: f64) {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(busy);
         while tokio::time::Instant::now() < deadline {
             std::hint::spin_loop();
-            if rand::random::<u8>() < 4 { tokio::task::yield_now().await; }
+            if get_random() % 64 == 0 { tokio::task::yield_now().await; }
         }
         if idle > 0 { tokio::time::sleep(Duration::from_millis(idle)).await; }
     }
@@ -102,7 +124,7 @@ async fn run_failure(state: Shared, mode: FailureMode) {
         FailureMode::IoError { .. } => {}
         FailureMode::RandomExit { min_ms, max_ms, exit_code } => {
             let delay = if max_ms > min_ms {
-                min_ms + (rand::random::<u64>() % (max_ms - min_ms))
+                min_ms + (get_random() % (max_ms - min_ms))
             } else { min_ms };
             tokio::time::sleep(Duration::from_millis(delay)).await;
             warn!(delay, exit_code, "Simulated random exit");

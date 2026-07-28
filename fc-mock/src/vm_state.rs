@@ -29,6 +29,10 @@ pub struct VmState {
     pub entropy: Option<EntropyDeviceConfig>,
     pub mmds_config: Option<MmdsConfig>,
     pub mmds_data: serde_json::Value,
+    pub balloon: Option<BalloonConfig>,
+    /// Free-page-hinting command counter. A real guest acknowledges the host's
+    /// command; with no guest we acknowledge immediately, so a drain never hangs.
+    pub balloon_host_cmd: i64,
 
     /// Allocated guest memory — readable via ProcessVMReadv by orchestrator.
     pub guest_mem: Option<GuestMemory>,
@@ -51,6 +55,8 @@ impl VmState {
             entropy: None,
             mmds_config: None,
             mmds_data: serde_json::Value::Null,
+            balloon: None,
+            balloon_host_cmd: 0,
             guest_mem: None,
             workload: None,
             started_at: None,

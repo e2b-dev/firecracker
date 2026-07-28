@@ -9,6 +9,7 @@
 //!   GET /memory/dirty   → { "bitmap": [u64] }
 //!   GET /memory/mappings→ { "mappings": [{ base_host_virt_addr, offset, page_size, size }] }
 
+use antithesis_sdk::random::get_random;
 use serde::Serialize;
 
 const PAGE_SIZE: usize = 4096;
@@ -116,8 +117,8 @@ impl GuestMemory {
     /// Touch random pages to simulate workload memory pressure.
     pub fn simulate_activity(&mut self, num_pages: usize) {
         for _ in 0..num_pages {
-            let idx = rand::random::<usize>() % self.total_pages;
-            self.touch_page(idx, rand::random());
+            let idx = (get_random() % self.total_pages as u64) as usize;
+            self.touch_page(idx, get_random() as u8);
         }
     }
 

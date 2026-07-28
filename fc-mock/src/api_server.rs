@@ -7,6 +7,7 @@
 
 use std::time::{Duration, Instant};
 
+use antithesis_sdk::random::get_random;
 use bytes::Bytes;
 use http::{Method, Response, StatusCode};
 use http_body_util::Full;
@@ -59,7 +60,7 @@ pub async fn handle(method: Method, path: &str, body: &[u8], state: Shared) -> R
             .unwrap_or(0.0);
         drop(s);
         if delay > 0 { tokio::time::sleep(Duration::from_millis(delay)).await; }
-        if io_err_p > 0.0 && rand::random::<f64>() < io_err_p {
+        if io_err_p > 0.0 && (get_random() % 1_000_000) as f64 / 1_000_000.0 < io_err_p {
             return err500("Simulated IO error");
         }
     }
@@ -122,6 +123,34 @@ pub async fn handle(method: Method, path: &str, body: &[u8], state: Shared) -> R
                 }
                 None => bad(&format!("Interface {id} not found")),
             }
+        }
+
+        // Balloon. Only reached from FC 1.14 up, where the orchestrator installs
+        // a zero-MiB balloon to enable free-page reporting/hinting.
+        (Method::PUT, ["balloon"]) => {
+            state.lock().await.balloon = Some(parse!(body, BalloonConfig));
+            no_content()
+        }
+
+        (Method::PATCH, ["balloon", "hinting", "start"]) => {
+            let _ = parse!(body, BalloonStartCmd);
+            let mut s = state.lock().await;
+            if s.balloon.is_none() {
+                return bad("Balloon device not configured");
+            }
+            // No guest exists to acknowledge, so complete the round trip here;
+            // otherwise the orchestrator's hinting drain waits forever.
+            s.balloon_host_cmd += 1;
+            no_content()
+        }
+
+        (Method::GET, ["balloon", "hinting", "status"]) => {
+            let s = state.lock().await;
+            let cmd = s.balloon_host_cmd;
+            json(
+                StatusCode::OK,
+                &BalloonHintingStatus { host_cmd: cmd, guest_cmd: Some(cmd) },
+            )
         }
 
         (Method::PUT, ["mmds", "config"]) => {
