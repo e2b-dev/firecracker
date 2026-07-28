@@ -375,6 +375,29 @@ async fn handle(
             json_resp(StatusCode::OK, &s.env_vars)
         }
 
+        // ── Mock control, reachable per sandbox ──────────────────────
+        // The Firecracker API lives on a unix socket inside the sandbox's netns,
+        // so a workload driver can't reach it. envd is routable through the
+        // client-proxy by sandbox id, so the control surface hangs off here:
+        // a driver can aim a fault at one specific sandbox.
+        (Method::PUT, ["mock", "workload"]) => {
+            match serde_json::from_slice::<crate::api_types::WorkloadConfig>(body) {
+                Ok(cfg) => {
+                    let mut s = vm_state.lock().await;
+                    s.workload = Some(cfg.clone());
+                    drop(s);
+                    crate::workload::start(vm_state, cfg);
+                    no_content()
+                }
+                Err(e) => envd_error(StatusCode::BAD_REQUEST, &e.to_string()),
+            }
+        }
+
+        (Method::GET, ["mock", "workload"]) => {
+            let s = vm_state.lock().await;
+            json_resp(StatusCode::OK, &s.workload)
+        }
+
         // ── Connect: process.Process/Start (server-streaming) ───────
         (Method::POST, ["process.Process", "Start"]) => {
             handle_process_start(body, content_type).await
