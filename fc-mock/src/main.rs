@@ -23,7 +23,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use vm_state::VmState;
 
@@ -86,6 +86,12 @@ struct Args {
     /// Disable the mock envd server
     #[arg(long = "no-envd")]
     no_envd: bool,
+
+    /// Address the guest would hold inside the sandbox netns. We stand in for
+    /// the guest, so we claim it on loopback; the netns DNATs to it and the
+    /// mock envd (bound to 0.0.0.0) then answers. Empty disables.
+    #[arg(long = "guest-ip", default_value = "169.254.0.21")]
+    guest_ip: String,
 }
 
 #[tokio::main]
@@ -136,6 +142,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The orchestrator expects envd at http://<sandbox_ip>:49983.
     let envd_state = Arc::new(Mutex::new(envd::EnvdState::new()));
     if !args.no_envd {
+        claim_guest_ip(&args.guest_ip);
+
         let addr: SocketAddr = format!("{}:{}", args.envd_addr, args.envd_port)
             .parse()
             .expect("invalid envd bind address");
@@ -240,4 +248,31 @@ async fn apply_config(state: &Arc<Mutex<VmState>>, cfg: &serde_json::Value) {
         }
     }
     if let Some(v) = cfg.get("metrics") { s.metrics = serde_json::from_value(v.clone()).ok(); }
+}
+
+/// Claim the guest's address on loopback inside the sandbox netns.
+///
+/// Real Firecracker gives the address to the guest, which answers over the tap
+/// device. We run no guest, so without this the netns DNATs envd traffic to an
+/// address nothing holds and the orchestrator times out waiting for envd.
+/// Best-effort: shells out to `ip`, and a failure only means envd is
+/// unreachable, which the caller will report on its own.
+fn claim_guest_ip(guest_ip: &str) {
+    if guest_ip.is_empty() {
+        return;
+    }
+
+    let _ = std::process::Command::new("ip")
+        .args(["link", "set", "lo", "up"])
+        .status();
+
+    match std::process::Command::new("ip")
+        .args(["addr", "add", &format!("{guest_ip}/32"), "dev", "lo"])
+        .status()
+    {
+        Ok(s) if s.success() => info!(guest_ip, "claimed guest IP on loopback"),
+        // Already present on a restore into a reused netns.
+        Ok(_) => info!(guest_ip, "guest IP already present on loopback"),
+        Err(e) => warn!(guest_ip, err = %e, "failed to run ip(8); envd will be unreachable"),
+    }
 }
