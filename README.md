@@ -1,3 +1,13 @@
+> [!IMPORTANT]
+> **This repository is archived.** E2B's Firecracker releases are built by the fc-versions
+> pipeline in [`e2b-dev/infra`](https://github.com/e2b-dev/infra) and published under the
+> `vX.Y-<major.minor.patch>` versioning scheme to the public artifact bucket
+> (`gs://e2b-artifact-binaries/firecrackers/`). The branches and tags here remain readable
+> for reference; builds from this repository use the legacy `vX.Y.Z_<sha>` naming and
+> receive no further updates.
+
+---
+
 <picture>
    <source media="(prefers-color-scheme: dark)" srcset="docs/images/fc_logo_full_transparent-bg_white-fg.png">
    <source media="(prefers-color-scheme: light)" srcset="docs/images/fc_logo_full_transparent-bg.png">
